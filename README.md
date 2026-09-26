@@ -209,6 +209,43 @@ envs\pg\Scripts\python.exe hand_probe.py --camera 0
 envs\pg\Scripts\python.exe tests\test_grip_offline.py
 ```
 
+### 6. 窗口应用（推荐给家长用）
+
+不想记命令行按键的话，直接**双击 `窗口应用.bat`** 就能开一个带界面版：
+
+```
+envs\pg\Scripts\python.exe app.py            # 或指定摄像头 app.py --camera 1
+```
+
+界面里右键按钮 / 左边画面 + 右侧实时显示「机位体检 + 样本计数」，按键和命令行版一致：
+
+| 键 | 作用 |
+|---|---|
+| `1` / `2` / `3` | 记录当前帧为 正确握笔 / 拇指包食指 / 其他错误 |
+| `[` / `]` | 锁定画面左半 / 右半那只手为被测手 |
+| `\` | 取消锁定 |
+| `空格` | 冻结 / 继续画面 |
+| `z` | 开关放大镜 |
+| `p` / 点按钮 | 出对照表 |
+| `w` | 保存样本 |
+
+⚠️ 窗口应用**不重写任何检测逻辑**，全部复用 `grip_metrics` / `hand_probe` 里的现有函数。
+为什么用 tkinter 而不是 PySide6：后者没装，而 tkinter 是 Python 自带、零新增依赖。
+
+### 7. 先探测摄像头（换机器 / 第一次跑前）
+
+**摄像头报的分辨率和实际能拿到的常常不一样** —— 本机请求 1080p 会被驱动
+**静默**降到 720p（不报错）。「手宽 ≥200px」按真实像素算，分辨率弄错门槛就失效。
+所以先跑一次探测，把真实上限写进配置，全流程统一用：
+
+```bash
+envs\pg\Scripts\python.exe tools\probe_camera.py
+```
+
+探测结果（最高分辨率 / 后端 / 推理耗时）写入 `pen_grip_config.json` 的 `camera` 段，
+实时预览、盲录、录像分析、窗口应用**都从它读**，保证门槛含义一致。
+详细数据见 [`docs/03-camera-resolution-and-app.md`](docs/03-camera-resolution-and-app.md)。
+
 ---
 
 ## 项目结构
@@ -217,7 +254,9 @@ envs\pg\Scripts\python.exe tests\test_grip_offline.py
 pen-grip-reminder/
 ├── 实测握笔.bat                双击开始实测（实时预览，机位能看见屏幕时用）
 ├── 录制握笔.bat                盲录一段（盖子压下去、屏幕看不见时用）
+├── 窗口应用.bat                窗口版（推荐给家长，不用记命令行）
 ├── 推送到GitHub.bat
+├── app.py                     窗口应用（tkinter，复用现有检测逻辑）
 ├── grip_metrics.py            核心：21 个手部点 -> 候选指标（纯函数，可离线测）
 ├── pg_utils.py                相机/模型/阈值工具（自包含）
 ├── hand_probe.py              对照实验工具
@@ -226,12 +265,15 @@ pen-grip-reminder/
 ├── tests/test_grip_offline.py 指标算法自检（71 项）
 ├── tools/
 │   ├── check_env.py           环境自检（依赖/模型/推理/摄像头）
+│   ├── probe_camera.py        摄像头分辨率探测（写 pen_grip_config.json）
 │   ├── record.py              盲录视频 + 存快照
 │   ├── fetch_models.py        下模型
 │   └── push_to_github.py      推送
 ├── docs/
 │   ├── 00-feasibility.md      可行性评估（含文献数据、方案对比）
-│   └── 01-plan.md             实施计划（里程碑、实验协议、机位方案、退路）
+│   ├── 01-plan.md             实施计划（里程碑、实验协议、机位方案、退路）
+│   ├── 02-camera-diagnosis.md 首段真人录像体检（机位判不出 → 根因/改法）
+│   └── 03-camera-resolution-and-app.md  摄像头分辨率探测 + 窗口应用
 ├── envs/pg/                   虚拟环境（不入库）
 ├── bench/models/              模型（不入库）
 └── hand_probe/                录像与样本（不入库 —— 含孩子影像）

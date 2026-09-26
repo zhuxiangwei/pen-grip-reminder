@@ -40,6 +40,93 @@ MODEL_DIRS = [
 DEFAULT_CAM_W = 1280
 DEFAULT_CAM_H = 720
 
+# ---------------------------------------------------------------- 摄像头配置
+#
+# ⚠️ 这三个默认值是**实测**出来的，不是猜的（见 tools/probe_camera.py）：
+#    本机摄像头（DSHOW 后端）的**硬件上限就是 1280x720**。
+#    请求 1920x1080 / 1600x1200 / 1440x1080 全都会被驱动**静默**降回 1280x720，
+#    不报错、不抛异常 —— 所以必须靠 `probe_camera.py` 回读真实值。
+#
+# ⚠️ 而且**降分辨率不会更快**：MediaPipe 内部会把输入缩到约 224px，
+#    实测 1280x720 单帧 18.5ms、320x180 也要 17.7ms，差不到 1ms。
+#    所以没有任何理由降分辨率 —— 全流程统一用硬件上限，信息量最大化。
+#
+# 「手宽 ≥200px」这个门槛按**真实采集像素**算，所以采集分辨率必须全流程一致，
+# 否则同一个机位会时合格时不合格。
+CAMERA_CONFIG_FILE = os.path.join(ROOT, "pen_grip_config.json")
+
+
+def load_camera_config():
+    """读 `pen_grip_config.json` 里的 `camera` 段（probe_camera.py 写入）。
+
+    读不到/字段缺失时返回 None，调用方退回 DEFAULT_CAM_* —— 
+    **不能让配置缺失把工具弄挂**，那样用户得先跑探测才能用任何东西。
+    """
+    import json
+    try:
+        with open(CAMERA_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:                                        # noqa: BLE001
+        return None
+    cam = cfg.get("camera")
+    if not isinstance(cam, dict):
+        return None
+    if not (cam.get("width") and cam.get("height")):
+        return None
+    return cam
+
+
+def camera_size():
+    """全流程统一的采集分辨率 (w, h)。
+
+    优先级：probe_camera.py 探测结果 > DEFAULT_CAM_*。
+    实时预览、盲录、录像分析**都用这一个函数**，
+    保证「手宽 200px」这条门槛在任何环节含义一致。
+    """
+    cam = load_camera_config()
+    if cam:
+        return int(cam["width"]), int(cam["height"])
+    return DEFAULT_CAM_W, DEFAULT_CAM_H
+
+
+def camera_index():
+    """全流程统一的摄像头索引。"""
+    cam = load_camera_config()
+    if cam and cam.get("index") is not None:
+        return int(cam["index"])
+    return 0
+
+
+def open_camera_auto(idx=None, width=None, height=None, backend=None):
+    """按配置打开摄像头（分辨率/索引都从配置来），返回 cap。
+
+    和 `open_camera()` 的区别：这个**优先走探测出来的配置**，
+    并且在分辨率被驱动降级时会**明确警告**（因为那意味着门槛失效）。
+    """
+    c = cv2()
+    w, h = camera_size()
+    if width or height:
+        w, h = width or w, height or h
+    if idx is None:
+        idx = camera_index()
+
+    cap = open_camera(idx=idx, backend=backend, width=w, height=h)
+
+    # 核对实际拿到的分辨率：驱动静默降级会让「200px 门槛」失去意义
+    frame = grab_frame(cap)
+    if frame is not None:
+        fh, fw = frame.shape[:2]
+        cfg = load_camera_config() or {}
+        mx_w, mx_h = cfg.get("max_width"), cfg.get("max_height")
+        if (fw, fh) != (w, h):
+            print(f"[摄像头] ⚠️ 请求 {w}x{h} 但实际拿到 {fw}x{fh} —— "
+                  f"驱动降级了。「手宽 ≥200px」的门槛按实际像素算。")
+        elif mx_w and (w, h) != (mx_w, mx_h):
+            print(f"[摄像头] ℹ️ 当前 {w}x{h}，但探测到的上限是 "
+                  f"{mx_w}x{mx_h} —— 想用满就删掉配置重跑 "
+                  f"tools\\probe_camera.py")
+    return cap
+
 _cv2 = None
 _cv2_tried = False
 

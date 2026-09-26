@@ -617,7 +617,8 @@ def run_live(cam_idx, backend, out_dir):
 
     model = pg.find_model(HAND_MODEL)
     hand = make_hand(model)
-    cap = pg.open_camera(cam_idx, backend)
+    # 分辨率从探测配置读（tools/probe_camera.py 写），保证全流程一致
+    cap = pg.open_camera_auto(idx=cam_idx, backend=backend)
     rec = Recorder()
 
     print(f"模型：{os.path.basename(model)}")

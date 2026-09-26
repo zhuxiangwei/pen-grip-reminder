@@ -56,11 +56,14 @@ def main():
     args = ap.parse_args()
 
     beep_on = not args.no_beep
-    cap = pg.open_camera(args.camera)
+    # 分辨率/索引都从探测配置读（tools/probe_camera.py 写）——
+    # 保证「手宽 ≥200px」这条门槛在录制的视频里含义一致
+    cap = pg.open_camera_auto(idx=args.camera)
     fr = pg.grab_frame(cap)
     if fr is None:
         sys.exit("摄像头打开成功但读不到画面")
     h, w = fr.shape[:2]
+    print(f"[录制] 采集分辨率 {w}x{h}（来自探测配置）")
 
     os.makedirs(OUT_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
