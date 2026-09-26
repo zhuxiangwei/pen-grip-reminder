@@ -1,0 +1,15 @@
+# 换行符统一策略
+#
+# ⚠️ 为什么必须显式声明：.bat 是 Windows 批处理，用 LF 换行在 cmd.exe 下
+#    可能出问题（尤其带标签/goto 的脚本）；而 .py 在 Windows 上如果被转成 CRLF，
+#    某些工具链会抱怨。两边都不能靠默认值碰运气。
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.task binary
+*.wav binary
+*.jpg binary
+*.png binary
