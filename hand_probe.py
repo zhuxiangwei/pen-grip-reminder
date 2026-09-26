@@ -266,6 +266,7 @@ class Recorder:
         self.data = {k: [] for k in CLASSES}
         self.window = window      # 抖动统计的滑动窗口
         self.centers = []         # 最近若干帧的掌心位置，用来算抖动
+        self.focus_hist = []      # 最近若干帧的两个判据指标，用来算"指标稳不稳"
         self.note = ""            # 画面上临时提示
         self.last = None
 
@@ -282,6 +283,32 @@ class Recorder:
             return None
         a = np.array(self.centers)
         return float(np.sqrt(a[:, 0].std() ** 2 + a[:, 1].std() ** 2))
+
+    def add_focus(self, m):
+        """记下两个判据指标的滚动历史，用来判断这个**角度**跟得稳不稳。
+
+        ⚠️ 为什么需要看指标自己的波动（不只是掌心抖动）：
+           判断「拇指包食指」靠的是拇指尖和食指那几个点。
+           如果这个角度下拇指挡住了食指，MediaPipe 只能**猜**被挡住的点，
+           表现就是：姿势没变、但指标在帧间乱跳。
+           掌心位置可能很稳（因为手没动），而这两个指标在飘 —— 只看掌心抖动发现不了。
+           所以要看**指标本身**的 std。
+        """
+        if not m:
+            return
+        v = (m.get("thumb_side"), m.get("thumb_index_dist"))
+        if v[0] is None or v[1] is None:
+            return
+        self.focus_hist.append(v)
+        del self.focus_hist[:-self.window]
+
+    @property
+    def focus_std(self):
+        """返回 (thumb_side_std, thumb_index_dist_std)；样本不足返回 (None, None)。"""
+        if len(self.focus_hist) < 8:
+            return None, None
+        a = np.array(self.focus_hist, dtype=float)
+        return float(a[:, 0].std()), float(a[:, 1].std())
 
     def record(self, key, m):
         self.data[key].append(dict(m))
@@ -438,12 +465,15 @@ def _zoom_thumb_index(frame, lm, size=210, pad=1.7):
 
 
 def draw(frame, lm, m, quality, counts, note="", zoom=True,
-         hands=None, sel=None, sel_lines=None, lock=None):
+         hands=None, sel=None, sel_lines=None, lock=None, focus_std=(None, None)):
     """画手部特写 + 指标。⚠️ 只能用 ASCII（OpenCV 写不了中文）。
 
     hands / sel 用来把**两只手都画出来**，并明确标出哪一只在被测。
     这一点很关键：孩子左手也搭在桌上，如果只画一只，
     选错了完全看不出来（用户实测踩到的就是这个问题）。
+
+    focus_std 是两个判据指标最近若干帧的波动，用来判断**这个角度可不可信**：
+    姿势没变时 std 应该很小；std 大说明模型在"猜"被挡住的点（遮挡严重）。
     """
     import cv2
     h, w = frame.shape[:2]
@@ -488,6 +518,21 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True,
     else:
         lines.append(("hand: not detected", qcolor["bad"]))
     lines.append((("view: " + quality.upper()), qcolor[quality]))
+
+    # 指标稳定性 —— 这是判断「这个角度到底行不行」的量化依据
+    # ⚠️ 姿势没变时这两个指标的 std 应该很小。std 大 = 模型在猜被挡住的点。
+    #    掌心可能很稳（手没动），所以只看掌心抖动发现不了这个问题。
+    s0, s1 = focus_std
+    if s0 is not None:
+        worst = max(s0 / 0.08, (s1 or 0.0) / 0.05)
+        if worst < 1.0:
+            lines.append(("metric stability: GOOD", (0, 200, 0)))
+        elif worst < 2.0:
+            lines.append(("metric stability: FAIR", (0, 180, 255)))
+        else:
+            lines.append(("metric stability: POOR!", (0, 0, 255)))
+            lines.append(("  -> change camera angle", (0, 0, 255)))
+
     if sel_lines is not None:
         lockname = {"screen_left": "LEFT half", "screen_right": "RIGHT half"}
         lines.append(("--- which hand ---", (200, 200, 200)))
@@ -502,6 +547,8 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True,
     right = []
     if m:
         right.append(("--- metrics (measured hand) ---", (200, 200, 200)))
+        sd = {"thumb_side": focus_std[0], "thumb_index_dist": focus_std[1]}
+        thr = {"thumb_side": 0.08, "thumb_index_dist": 0.05}
         order = list(gm.THUMB_OVER_INDEX_PAIR) + [
             "thumb_index_gap", "thumb_index_angle",
             "fist", "curl_index", "tip_close", "spread"]
@@ -513,11 +560,16 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True,
                 continue
             col = (120, 220, 255)
             if k in gm.THUMB_OVER_INDEX_PAIR:
-                # 拇指越过量偏正 = 疑似包住食指 —— 变红提醒
+                col = (200, 255, 255)
                 if k == "thumb_side" and v > 0.25:
-                    col = (80, 80, 255)
-                else:
-                    col = (200, 255, 255)
+                    col = (80, 80, 255)          # 疑似包住 —— 变红
+                s = sd.get(k)
+                if s is not None:
+                    # 把波动一起显示：姿势稳住时应该小；大 = 这个角度在"猜"
+                    mark = "ok" if s < thr[k] else "NOISY"
+                    right.append(("%-16s %7.3f +-%.3f %s"
+                                  % (label, v, s, mark), col))
+                    continue
             right.append(("%-16s %7.3f" % (label, v), col))
 
     for i, (t, c) in enumerate(lines):
@@ -559,6 +611,19 @@ def run_live(cam_idx, backend, out_dir):
     print("① 摆机位：桌面斜上方俯视手部，让手占画面主体。")
     print("   先看左边三行：hand width 要 ≥200px、view 要是 OK。")
     print("   view 显示 marginal/bad 时录不进样本（会被拒绝）—— 先把机位调好。")
+    print()
+    print("   ⚠️ 你的机位（电脑在孩子左边、镜头朝右）是从【拇指那一侧】看右手。")
+    print("      而判断「拇指有没有压过食指」必须看得见【食指】——")
+    print("      从拇指侧平着看，食指会被拇指挡住，模型只能猜。")
+    print("      对策：**把摄像头抬高，让它以 45~60° 俯角往下看手**。")
+    print("      有了俯视分量，才看得见拇指和食指的左右关系。")
+    print("      如果抬高还是不行，再考虑把摄像头挪到孩子**右侧**（小指那一侧）。")
+    print()
+    print("   怎么判断行不行？看左边那行 `metric stability`：")
+    print("      GOOD = 姿势稳住时指标很稳，这个角度可用")
+    print("      FAIR = 勉强")
+    print("      POOR = 指标在乱跳，说明角度不行，**必须换角度再录**")
+    print("   （姿势没变却跳，就是模型在猜被挡住的点 —— 录出来的数据不能用。）")
     print()
     print("② 盯右下角的「拇指-食指放大镜」：确认关键点确实贴在小手上。")
     print("   拇指尖画的是红圈。如果红圈飘在手指外面，说明这个角度跟不住，")
@@ -619,6 +684,7 @@ def run_live(cam_idx, backend, out_dir):
         lm = hands[sel][0] if sel is not None else None
         m = gm.compute_grip_metrics(lm, w, h) if lm is not None else None
         rec.add_center(m, lm, w, h)
+        rec.add_focus(m)                    # 指标稳定性（判断角度可不可信）
         quality, qmsg = gm.view_quality(m, rec.jitter)
         rec.last = (m, quality, sel, sels.note)
 
@@ -627,7 +693,7 @@ def run_live(cam_idx, backend, out_dir):
                    draw(fr, lm, m, quality, rec.counts(), note, zoom=zoom,
                         hands=hands, sel=sel,
                         sel_lines=sels.label(hands, sel, w, h),
-                        lock=sels.lock))
+                        lock=sels.lock, focus_std=rec.focus_std))
         k = cv2.waitKey(1) & 0xFF
         key = chr(k) if 0 <= k < 128 else ""
 
@@ -692,7 +758,7 @@ def run_live(cam_idx, backend, out_dir):
             cv2.imwrite(p, draw(fr, lm, m, quality, rec.counts(), note,
                                 zoom=zoom, hands=hands, sel=sel,
                                 sel_lines=sels.label(hands, sel, w, h),
-                                lock=sels.lock))
+                                lock=sels.lock, focus_std=rec.focus_std))
             print(f"  已存 {p}")
 
     cap.release()
