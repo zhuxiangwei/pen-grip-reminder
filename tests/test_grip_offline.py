@@ -159,6 +159,43 @@ def test_invariance():
         f"{base['px_w']:.0f} -> {scaled['px_w']:.0f}")
 
 
+# ---------------------------------------------------------------- B2. 镜像
+
+def test_mirror():
+    """镜像不变性：把整只手翻转 x，所有手部内禀指标必须**一模一样**。
+
+    ⚠️ 这条测试的意义很大：它证明**指标不需要知道是左手还是右手**。
+
+    背景：MediaPipe 的 handedness 标签（Left/Right）**不可靠** ——
+    它假设输入图像是"镜像的"（自拍视角），用外接摄像头时左右会颠倒。
+    但我们的指标全都是从关键点之间的相对关系算的：
+      · across = normalize(小指根 - 食指根)
+      · thumb_side = dot(拇指尖 - 食指根, across)
+    镜像时两个向量都翻转 x，点积里的 x*x 项不变 —— 所以结果不变。
+
+    也就是说：孩子用左手还是右手，**判据不用改**。
+    （真正的问题是"选错手"，那是选择逻辑的事，见 hand_probe.py。）
+    """
+    print("\n[B2] 镜像不变性（指标不关心左右手 —— MediaPipe 的 handedness 标签不可信）")
+
+    w, h = 1280, 720
+    pts = gm.synthetic_hand(curl=(0.5, 0.7, 0.75, 0.8), thumb_side=0.45,
+                            thumb_spread=1.0)
+    normal = gm.compute_grip_metrics(gm.to_normalized(pts, w, h), w, h)
+    mirrored_pts = [(-x, y) for (x, y) in pts]        # 翻转 x = 换成另一只手
+    mirror = gm.compute_grip_metrics(gm.to_normalized(mirrored_pts, w, h), w, h)
+
+    for k in ("fist", "curl_index", "tip_close", "spread", "thumb_index_gap",
+              "thumb_side", "thumb_index_dist", "thumb_index_pos",
+              "thumb_index_angle"):
+        close(f"B2 镜像后 {k} 不变", mirror[k], normal[k], 1e-9)
+
+    # 逐条确认：thumb_side 在镜像下确实不变（这是"左右手通吃"的关键）
+    ok_("B2 thumb_side 镜像不变 -> 左右手用同一套判据、正负方向不用翻",
+        abs(mirror["thumb_side"] - normal["thumb_side"]) < 1e-9,
+        f"正常 {normal['thumb_side']:+.4f}  镜像 {mirror['thumb_side']:+.4f}")
+
+
 # ---------------------------------------------------------------- C. 方向正确性
 
 def test_directions():
@@ -306,6 +343,7 @@ def main():
     print("=" * 62)
     test_aspect_ratio()
     test_invariance()
+    test_mirror()
     test_directions()
     test_degenerate()
     test_view_gate()

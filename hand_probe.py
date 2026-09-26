@@ -33,6 +33,9 @@
     1  把当前这一帧记成「正确握笔」
     2  把当前这一帧记成「**拇指包食指**」（主要要抓的问题）
     3  把当前这一帧记成「其他错误」（拳握等，留着免得污染「正确」那一类）
+    [  锁定「画面左半」那只手为被测手（画面正中有分界线）
+    ]  锁定「画面右半」那只手
+    \\  取消锁定，回到自动（按运动量猜写字的手）
     r  清空已记录的数据，重来
     p  打印对照表（这一步才是重点）
     w  把已录的样本存成 json（方便发给别人复核）
@@ -40,7 +43,27 @@
     s  存一张当前画面
     q / ESC  退出
 
-⚠️ 只在「视角合格」时才允许记录（手太小/抖动大会被拒绝并提示），
+⚠️ **关于「测哪一只手」**（用户实测踩到的坑）
+------------------------------------------
+孩子写字时**左手也搭在桌面上**，两只手都在画面里。
+原来的实现 `num_hands=1` 只回一只，很可能就是那只**静止的左手** ——
+指标全算在错的手上，看起来就像"总是误识别左手"。
+
+⚠️ 而 MediaPipe 的 `handedness` 标签（Left/Right）**不能用来选**：
+   它假设输入图像是**镜像的**（自拍视角），外接摄像头是正像，
+   所以标签会**左右报反** —— 这是"总是识别成左手"的直接来源。
+   本工具改用**画面位置**（左半/右半）指定，完全不碰那个标签；
+   标签只在屏幕上显示出来做参考，并标注 UNRELIABLE。
+
+选法优先级：
+  1. **手动锁定**（`[` / `]`，存进 `pen_grip_config.json`，下次沿用）—— 最可靠
+  2. 自动：运动量大的那只（写字的手一直在动，搭在桌上的基本不动）
+  3. 分不出来时**拒绝记录**并提示锁定 —— 录到错的手上比没数据更糟
+
+好消息：**指标本身不关心左右手**。判据是手部内禀的，镜像下完全不变
+（离线自检 B2 专门锁这条），所以左右手用同一套判据、正负方向不用翻。
+
+⚠️ 另外，只有「视角合格」时才允许记录（手太小/抖动大会被拒绝并提示），
    因为在小样本上录出来的数据本身就没意义。
 
 判据说明（「拇指包住食指」到底看什么）
@@ -72,6 +95,7 @@
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -115,9 +139,124 @@ def make_hand(model_path):
     return vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=model_path),
         running_mode=vision.RunningMode.VIDEO,
-        num_hands=1,
+        # ⚠️ 必须是 2，不是 1。
+        #    孩子写字时**左手也搭在桌面上**，两只手都在画面里。
+        #    设成 1 的话模型只回一只（很可能就是那只静止的左手），
+        #    指标全算在错的手上 —— 这是实测踩到的坑。
+        num_hands=2,
         min_hand_detection_confidence=0.3,   # 宁可检测到再筛，别漏
         min_tracking_confidence=0.3))
+
+
+# ---------------------------------------------------------------- 配置持久化
+
+CONFIG_PATH = os.path.join(ROOT, "pen_grip_config.json")
+
+
+def load_cfg():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cfg(d):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+class HandSelector:
+    """决定测**哪一只手**。
+
+    ⚠️ 为什么需要它（用户实测踩到的）
+    ------------------------------
+    孩子写字时左手也搭在桌面上，**两只手都在画面里**。
+    原来 `num_hands=1` 只回一只，很可能就是那只静止的左手 → 指标全算错。
+
+    ⚠️ 为什么不能用 MediaPipe 的 handedness 标签来选
+    ---------------------------------------------
+    它的 Left/Right **假设输入图像是镜像的**（自拍视角）。
+    外接摄像头是正像，所以标签会**左右报反** —— 实测就出现了"总是误识别左手"。
+    所以这里用**画面位置**（左半 / 右半）来指定，完全不碰那个标签。
+    标签只显示出来做参考，并明确标注"不可信"。
+
+    选法优先级：
+      1. **手动锁定**（`[` / `]` 键指定画面左半 / 右半那只，存进 config，下次记住）
+         —— 最可靠。机位固定时锁一次就不用再管。
+      2. 自动：**运动量大的那只**（写字的手一直在动，搭在桌上的基本不动）
+      3. 分不出来时**拒绝记录**并提示按 `[` / `]` 锁定
+    """
+
+    def __init__(self, lock=None, window=20):
+        self.lock = lock          # None / "screen_left" / "screen_right"
+        self.window = window
+        self.prev = []
+        self.motion = []
+        self.note = ""
+
+    @staticmethod
+    def center(lm, w, h):
+        n = len(lm)
+        return (sum(p.x for p in lm) / n * w, sum(p.y for p in lm) / n * h)
+
+    def update(self, hands, w, h):
+        """hands: [(lm, handedness_label)] -> 返回选中手的下标；分不出返回 None。"""
+        centers = [self.center(lm, w, h) for lm, _ in hands]
+
+        # 运动量 = 与上一帧最近掌心的位移（EMA 平滑）
+        mot = []
+        for c in centers:
+            if not self.prev:
+                mot.append(0.0)
+            else:
+                mot.append(min(math.hypot(c[0] - p[0], c[1] - p[1])
+                               for p in self.prev))
+        self.prev = centers
+        self.motion = (mot if len(self.motion) != len(mot)
+                       else [0.7 * a + 0.3 * b for a, b in zip(self.motion, mot)])
+
+        if not hands:
+            self.note = "画面里没检测到手"
+            return None
+        if len(hands) == 1:
+            self.note = "画面里只有一只手 —— 就测它"
+            return 0
+
+        # ---- 1) 手动锁定（按画面位置，不看 handedness 标签）----
+        if self.lock in ("screen_left", "screen_right"):
+            want_left = self.lock == "screen_left"
+            cand = [i for i, c in enumerate(centers)
+                    if (c[0] < w / 2) == want_left]
+            side = "左半" if want_left else "右半"
+            if len(cand) == 1:
+                self.note = f"已锁定：画面{side}那只"
+                return cand[0]
+            self.note = f"锁定了画面{side}，但那一侧现在有 {len(cand)} 只手 —— 请调整"
+            return None
+
+        # ---- 2) 自动：运动量大的是写字的手 ----
+        best = max(range(len(hands)), key=lambda i: self.motion[i])
+        if self.motion[best] < 1.5:        # 都几乎不动，分不出来
+            self.note = "两只手都没怎么动 —— 按 [ 或 ] 指定写字的那只手"
+            return None
+        self.note = f"自动选中：动得多的那只（{self.motion[best]:.1f}px/帧）"
+        return best
+
+    def label(self, hands, sel, w, h):
+        """给画面上每只手生成一行说明（含 handedness 标签，标注不可信）。"""
+        out = []
+        for i, (lm, hd) in enumerate(hands):
+            c = self.center(lm, w, h)
+            side = "左半" if c[0] < w / 2 else "右半"
+            tag = "MEASURING" if i == sel else "ignored"
+            mot = self.motion[i] if i < len(self.motion) else 0.0
+            out.append((f"{side} x={c[0]:.0f} mp={mot:.1f} "
+                        f"[{hd}?] {tag}", i == sel))
+        return out
 
 
 class Recorder:
@@ -298,11 +437,40 @@ def _zoom_thumb_index(frame, lm, size=210, pad=1.7):
     return frame
 
 
-def draw(frame, lm, m, quality, counts, note="", zoom=True):
-    """画手部特写 + 指标。⚠️ 只能用 ASCII（OpenCV 写不了中文）。"""
+def draw(frame, lm, m, quality, counts, note="", zoom=True,
+         hands=None, sel=None, sel_lines=None, lock=None):
+    """画手部特写 + 指标。⚠️ 只能用 ASCII（OpenCV 写不了中文）。
+
+    hands / sel 用来把**两只手都画出来**，并明确标出哪一只在被测。
+    这一点很关键：孩子左手也搭在桌上，如果只画一只，
+    选错了完全看不出来（用户实测踩到的就是这个问题）。
+    """
     import cv2
     h, w = frame.shape[:2]
     out = frame.copy()
+
+    # 画面左右分界线 —— 锁定用的就是"左半/右半"，画出来让用户有依据
+    if hands is not None and len(hands) > 1:
+        cv2.line(out, (w // 2, 0), (w // 2, h), (90, 90, 90), 1)
+        cv2.putText(out, "left half", (12, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (90, 90, 90), 1)
+        cv2.putText(out, "right half", (w // 2 + 12, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (90, 90, 90), 1)
+
+    # 先画**没被测**的手（灰暗），再画被测的（亮绿），避免被盖住
+    if hands:
+        for i, (h_lm, _hd) in enumerate(hands):
+            if i == sel:
+                continue
+            pts = [(int(p.x * w), int(p.y * h)) for p in h_lm]
+            for a, b in HAND_CONNECTIONS:
+                cv2.line(out, pts[a], pts[b], (110, 110, 110), 1)
+            for p in pts:
+                cv2.circle(out, p, 2, (150, 150, 150), -1)
+            c = (int(sum(p.x for p in h_lm) / len(h_lm) * w),
+                 int(sum(p.y for p in h_lm) / len(h_lm) * h))
+            cv2.putText(out, "ignored", (c[0] - 30, c[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (130, 130, 130), 1)
 
     if lm is not None:
         pts = [(int(p.x * w), int(p.y * h)) for p in lm]
@@ -312,7 +480,7 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True):
             cv2.circle(out, p, 4 if i in (4, 8, 12, 16, 20) else 3,
                        (255, 255, 255), -1)
 
-    # 左侧：视角质量（第 0 关）
+    # 左侧：视角质量（第 0 关）+ 选手机制状态
     qcolor = {"ok": (0, 200, 0), "marginal": (0, 180, 255), "bad": (0, 0, 255)}
     lines = []
     if m:
@@ -320,10 +488,20 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True):
     else:
         lines.append(("hand: not detected", qcolor["bad"]))
     lines.append((("view: " + quality.upper()), qcolor[quality]))
-    lines.append(("--- metric candidates ---", (200, 200, 200)))
+    if sel_lines is not None:
+        lockname = {"screen_left": "LEFT half", "screen_right": "RIGHT half"}
+        lines.append(("--- which hand ---", (200, 200, 200)))
+        lk = lockname.get(lock, "AUTO (motion)")
+        lines.append(("lock: " + lk,
+                      (0, 220, 255) if lock is None else (0, 200, 0)))
+        for t, is_sel in sel_lines:
+            lines.append((t, (0, 220, 0) if is_sel else (140, 140, 140)))
+        lines.append(("[?]=handedness label UNRELIABLE", (120, 120, 160)))
+
     # 右侧：候选指标。重点那两个（判断「包食指」的合成判据）放最上面并加亮。
     right = []
     if m:
+        right.append(("--- metrics (measured hand) ---", (200, 200, 200)))
         order = list(gm.THUMB_OVER_INDEX_PAIR) + [
             "thumb_index_gap", "thumb_index_angle",
             "fist", "curl_index", "tip_close", "spread"]
@@ -346,15 +524,16 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True):
         cv2.putText(out, t, (12, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, c, 2)
     for i, (t, c) in enumerate(right):
-        cv2.putText(out, t, (w - 330, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(out, t, (w - 340, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, c, 1)
 
     # 底部：已录样本数 + 提示
     cnt = "  ".join(f"[{k}]{CLASSES[k][0][:2]}={counts[k]}" for k in CLASSES)
     cv2.putText(out, cnt, (12, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (255, 255, 255), 2)
-    cv2.putText(out, "1/2/3 record   p compare   r reset   w save   z zoom   q quit",
-                (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+    cv2.putText(out, "1/2/3 rec  [/]=lock hand  \\=auto  p cmp  r reset  "
+                     "w save  z zoom  q quit",
+                (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                 (180, 180, 180), 1)
     if note:
         cv2.putText(out, note, (12, h - 64), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
@@ -398,6 +577,21 @@ def run_live(cam_idx, backend, out_dir):
     print("=" * 64)
     print()
 
+    # ---- 选哪一只手（实测踩到的问题：左手也搭在桌上，会被当成被测的手）----
+    cfg = load_cfg()
+    sels = HandSelector(lock=cfg.get("hand_lock"))
+    if sels.lock:
+        side = "画面左半" if sels.lock == "screen_left" else "画面右半"
+        print(f"【选手】沿用上次的锁定：{side}那只")
+    else:
+        print("【选手】当前是自动模式（按运动量猜写字的手）。")
+        print("       ⚠️ 如果屏幕上 MEASURING 标在了错的那只手上，立刻按")
+        print("          [  = 锁定画面左半那只（画面正中有分界线）")
+        print("          ]  = 锁定画面右半那只")
+        print("          \\  = 取消锁定，回到自动")
+        print("       锁定会记住，下次直接沿用。")
+    print()
+
     tick = 0
     last_note = 0.0
     zoom = True        # 拇指-食指放大镜，z 键切换
@@ -411,15 +605,29 @@ def run_live(cam_idx, backend, out_dir):
         r = hand.detect_for_video(
             mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), tick)
 
-        lm = r.hand_landmarks[0] if r.hand_landmarks else None
+        # 两手都收下来（含 handedness 标签 —— 只做展示，不拿它做判断）
+        hands = []
+        for i, h_lm in enumerate(r.hand_landmarks or []):
+            hd = "?"
+            if r.handedness and i < len(r.handedness) and r.handedness[i]:
+                cat = r.handedness[i][0]
+                hd = getattr(cat, "category_name", None) or getattr(
+                    cat, "display_name", "?")
+            hands.append((h_lm, hd))
+
+        sel = sels.update(hands, w, h)
+        lm = hands[sel][0] if sel is not None else None
         m = gm.compute_grip_metrics(lm, w, h) if lm is not None else None
         rec.add_center(m, lm, w, h)
         quality, qmsg = gm.view_quality(m, rec.jitter)
-        rec.last = (m, quality)
+        rec.last = (m, quality, sel, sels.note)
 
         note = rec.note if time.time() - last_note < 2.5 else ""
-        cv2.imshow("pen grip probe  (1/2/3 record  p compare  z zoom  q quit)",
-                   draw(fr, lm, m, quality, rec.counts(), note, zoom=zoom))
+        cv2.imshow("pen grip probe  ([/] lock hand  p compare  z zoom  q quit)",
+                   draw(fr, lm, m, quality, rec.counts(), note, zoom=zoom,
+                        hands=hands, sel=sel,
+                        sel_lines=sels.label(hands, sel, w, h),
+                        lock=sels.lock))
         k = cv2.waitKey(1) & 0xFF
         key = chr(k) if 0 <= k < 128 else ""
 
@@ -428,10 +636,31 @@ def run_live(cam_idx, backend, out_dir):
         elif key == "z":
             zoom = not zoom
             print(f"  拇指-食指放大镜：{'开' if zoom else '关'}")
+        elif key in ("[", "]"):
+            # 按**画面位置**锁定，不用 MediaPipe 的 handedness 标签（那个会报反）
+            sels.lock = "screen_left" if key == "[" else "screen_right"
+            cfg["hand_lock"] = sels.lock
+            save_cfg(cfg)
+            print(f"  ✓ 已锁定：{'画面左半' if key == '[' else '画面右半'}那只"
+                  f"（已记住，下次沿用）")
+            rec.note = "hand locked"
+            last_note = time.time()
+        elif key == "\\":
+            sels.lock = None
+            cfg.pop("hand_lock", None)
+            save_cfg(cfg)
+            print("  ✓ 已取消锁定，回到自动（按运动量猜）")
+            rec.note = "auto hand"
+            last_note = time.time()
         elif key in CLASSES:
-            if quality != "ok":
-                # ⚠️ 视角不合格就拒绝记录。在手太小/抖得厉害的帧上录下来的
-                #    样本本身没有意义，收进来只会污染结论。
+            if sel is None:
+                # ⚠️ 分不出哪只手是写字的手时**拒绝记录**。
+                #    录到错的手上的数据比没数据更糟 —— 会污染结论。
+                rec.note = "NO HAND SELECTED"
+                print(f"  ✗ 拒绝记录（{CLASSES[key][0]}）：{sels.note}")
+                print("     按 [ 或 ] 指定写字的那只手（画面正中有分界线）")
+            elif quality != "ok":
+                # ⚠️ 同理：视角不合格就拒绝记录。
                 rec.note = f"REFUSED ({quality})"
                 print(f"  ✗ 拒绝记录（{CLASSES[key][0]}）：{qmsg}")
             else:
@@ -460,7 +689,10 @@ def run_live(cam_idx, backend, out_dir):
         elif key == "s":
             os.makedirs(out_dir, exist_ok=True)
             p = os.path.join(out_dir, time.strftime("probe_%Y%m%d-%H%M%S.jpg"))
-            cv2.imwrite(p, draw(fr, lm, m, quality, rec.counts(), note))
+            cv2.imwrite(p, draw(fr, lm, m, quality, rec.counts(), note,
+                                zoom=zoom, hands=hands, sel=sel,
+                                sel_lines=sels.label(hands, sel, w, h),
+                                lock=sels.lock))
             print(f"  已存 {p}")
 
     cap.release()
@@ -470,8 +702,7 @@ def run_live(cam_idx, backend, out_dir):
     print("\n=== 退出小结 ===")
     print("  样本数：" + "  ".join(f"{CLASSES[k][0]}={cnt[k]}" for k in CLASSES))
     if sum(cnt.values()) >= 15:
-        print("  跑一次完整对照：python repos\\p1-pen-grip\\hand_probe.py "
-              "--replay 上面用 w 存的文件")
+        print("  跑一次完整对照：python hand_probe.py --replay 上面用 w 存的文件")
     return rec
 
 
@@ -514,6 +745,7 @@ def run_image(path):
     r = hand.detect_for_video(mp.Image(
         image_format=mp.ImageFormat.SRGB, data=fr[:, :, ::-1].copy()), 33)
     lm = r.hand_landmarks[0] if r.hand_landmarks else None
+    n_hands = len(r.hand_landmarks or [])
     m = gm.compute_grip_metrics(lm, w, h) if lm is not None else None
     quality, qmsg = gm.view_quality(m)
     hand.close()
@@ -522,18 +754,23 @@ def run_image(path):
     if lm is None:
         print("❌ 画面里没检测到手 —— 先解决「手进不了画面」。")
         return 1
+    if n_hands > 1:
+        print(f"⚠️ 画面里检测到 **{n_hands} 只手**。静态图片里没法按运动量区分，")
+        print("   这里只取了第一只来算 —— 结果**可能不是写字的那只手**。")
+        print("   要正确区分请用 --camera 模式，按 [ 或 ] 锁定被测手。")
     print(f"手部像素宽：{m['px_w']:.0f}px   掌宽：{m['palm_w']:.0f}px")
     print(f"视角判定：{quality} —— {qmsg}")
     print("\n候选指标：")
-    for k in ("fist", "curl_index", "tip_close", "spread",
-              "thumb_index_gap", "thumb_side", "thumb_index_angle"):
+    for k in ("fist", "curl_index", "tip_close", "spread", "thumb_index_gap",
+              "thumb_side", "thumb_index_dist", "thumb_index_pos",
+              "thumb_index_angle"):
         v = m.get(k)
         print(f"  {gm.METRIC_INFO[k][0]:<16} {'n/a' if v is None else f'{v:.3f}'}")
     out = os.path.splitext(path)[0] + "_probe.jpg"
     cv2.imwrite(out, draw(fr, lm, m, quality, {k: 0 for k in CLASSES}))
     print(f"\n标注图已存：{out}")
     print("\n⚠️ 单张图只能说「看得见吗」。要判断「分得开吗」，"
-          "得给三种握法各录一组，跑 --camera 模式。")
+          "得给两种握法各录一组，跑 --camera 模式。")
     return 0 if quality == "ok" else 1
 
 
