@@ -149,7 +149,7 @@ def test_invariance():
     moved = metrics(dx=400.0, dy=-250.0)
     scaled = metrics(scale=2.7)
     for k in ("fist", "tip_close", "spread", "thumb_index_gap", "thumb_side",
-              "thumb_index_angle"):
+              "thumb_index_dist", "thumb_index_pos", "thumb_index_angle"):
         close(f"B1 平移后 {k} 不变", moved[k], base[k], 1e-9)
         close(f"B2 放大 2.7 倍后 {k} 不变", scaled[k], base[k], 1e-9)
 
@@ -192,6 +192,53 @@ def test_directions():
     near = metrics(thumb_spread=0.6)["thumb_index_gap"]
     far = metrics(thumb_spread=1.4)["thumb_index_gap"]
     ok_("C7 拇指远离食指 -> thumb_index_gap 变大", far > near,
+        f"{near:.3f} -> {far:.3f}")
+
+    # thumb_index_pos：**食指伸直时**，拇指沿手指方向伸出 -> 落点单调后移。
+    # ⚠️ 两条几何事实必须写进断言：
+    #   1) 食指一弯，折线先上再折回来，"最近点"会沿链条倒退，
+    #      pos 不再代表"往指尖方向" —— 所以必须在 curl=0 下测。
+    #      （这不是 bug，是"到折线最近点"这个定义的固有性质，
+    #        因此 thumb_index_pos 只当参考信息，不当判据。）
+    #   2) 拇指越过食指尖之后，最近点恒为食指尖，pos 钳在 1.0 —— 会饱和。
+    #      所以是"单调不减 + 有实际上升"，不是严格递增。
+    vals = [metrics(curl=(0.0, 0.0, 0.0, 0.0),
+                    thumb_along_shift=s)["thumb_index_pos"]
+            for s in (-0.2, 0.0, 0.2, 0.4)]
+    ok_("C8 食指伸直时，拇指伸出手 -> thumb_index_pos 单调不减且落到饱和值 1.0",
+        all(vals[i] <= vals[i + 1] for i in range(len(vals) - 1))
+        and vals[-1] > vals[0] and abs(vals[-1] - 1.0) < 1e-9,
+        f"{['%.3f' % v for v in vals]}")
+
+    # ⚠️ 这条是对一个真实 bug 的回归锁：
+    #    最初用「拇指尖沿食指轴的投影」衡量位置，食指一弯那条轴就转向侧面，
+    #    投影会变成负数（实测 -0.166）。改成"到折线的最近点弧长"后
+    #    天然落在 [0,1]，不可能为负。弯曲参数扫一遍确认。
+    allpos = []
+    for c in (0.0, 0.3, 0.6, 1.0):
+        m = metrics(curl=(c, c, c, c))
+        allpos.append(m["thumb_index_pos"])
+    ok_("C9 thumb_index_pos 在食指任何弯曲度下都落在 [0,1]（回归锁）",
+        all(v is not None and 0.0 <= v <= 1.0 for v in allpos),
+        f"{['%.3f' % v for v in allpos]}")
+
+    # 两个参数应当基本解耦：固定 thumb_side 只调 thumb_along_shift，
+    # thumb_side 只许有很小的连带变化。
+    # ⚠️ 不能要求**完全**不变：thumb_side 的投影轴是「食指根→小指根」，
+    #    这个轴并不垂直于手指方向（合成手里它带 -0.14 的 y 分量，
+    #    真实手掌也不是严格垂直）。所以沿 +y 移动拇指必然轻微改变投影 ——
+    #    这是几何事实，不是 bug。要求的是"连带上限"。
+    a = metrics(thumb_side=0.5, thumb_along_shift=0.0)
+    b = metrics(thumb_side=0.5, thumb_along_shift=0.4)
+    d_side = abs(a["thumb_side"] - b["thumb_side"])
+    ok_("C10 调 thumb_along_shift 对 thumb_side 的连带影响很小（<0.15，且远小于直接效果 0.4）",
+        d_side < 0.15,
+        f"Δside={d_side:.4f}  side {a['thumb_side']:.4f}->{b['thumb_side']:.4f}")
+
+    # 拇指抬离食指 -> 到食指的距离变大
+    near = metrics(thumb_spread=1.0)["thumb_index_dist"]
+    far = metrics(thumb_spread=1.8)["thumb_index_dist"]
+    ok_("C11 拇指抬离食指 -> thumb_index_dist 变大", far > near,
         f"{near:.3f} -> {far:.3f}")
 
 
@@ -272,7 +319,7 @@ def main():
         print(f"结果：{PASS}/{PASS + FAIL} 全部通过 ✅")
     print("=" * 62)
     print("\n⚠️ 这份自检只证明「指标算得对」，**不能**证明「指标能识别握笔姿势对不对」。")
-    print("   后者必须用真实数据实测 —— 用 :repos/p1-pen-grip/hand_probe.py 做对照。")
+    print("   后者必须用真实数据实测 —— 用 hand_probe.py 做对照。")
     return 1 if FAIL else 0
 
 

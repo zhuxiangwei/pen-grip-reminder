@@ -76,8 +76,29 @@ METRIC_INFO = {
     "spread": ("指尖张开度", "", "越小越挤在一起"),
     "thumb_index_gap": ("拇指食指间距", "", "偏大可能没捏住笔"),
     "thumb_side": ("拇指横向越过量", "", "**偏正 = 拇指越到食指外侧（包食指）**"),
+    "thumb_index_dist": ("拇指尖到食指的距离", "",
+                         "**越小 = 真的搭在食指上**"),
+    "thumb_index_pos": ("搭在食指哪一段", "",
+                        "0=食指根，1=食指尖。≈0.3~0.9 = 压在中段"),
     "thumb_index_angle": ("拇指食指夹角", "°", "偏小可能捏太紧/包住"),
 }
+
+# 「拇指包住食指」这个具体问题的判据由**两个**指标合成，缺一不可：
+#
+#   thumb_side       拇指尖相对「食指根→小指根」这条横轴的偏移
+#                    （正 = 越到食指外侧 = 包住）
+#   thumb_index_dist 拇指尖到食指折线的最短距离（小 = 真的搭上去了）
+#
+# ⚠️ 为什么必须两个一起看：
+#    只看 thumb_side → 拇指**伸得很长越过食指尖**、或者**根本没碰到食指**
+#    也可能偏正，但那是别的形态，纠正方式完全不同。
+#    只看距离 → 分不清"搭在食指的哪一侧"（正常捏笔时拇指也贴着食指）。
+#    两个一起才能说清「压过食指」这件事。
+#
+# ⚠️ 为什么用「到折线的距离」而不是「沿食指轴的投影」：
+#    食指一弯，MCP→TIP 这条轴就转向侧面了，投影会变成负数、语义失效。
+#    距离对弯曲免疫。这个坑是离线自检 C9/C10 抓出来的。
+THUMB_OVER_INDEX_PAIR = ("thumb_side", "thumb_index_dist")
 
 
 def _px(lm, w, h, i):
@@ -111,6 +132,18 @@ def _angle_at(a, vertex, b):
         return None
     c = max(-1.0, min(1.0, _dot(v1, v2) / (n1 * n2)))
     return math.degrees(math.acos(c))
+
+
+def _seg_dist(p, a, b):
+    """点 p 到线段 ab 的最短距离，以及最近点在线段上的参数 t∈[0,1]。"""
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-12:
+        return math.hypot(p[0] - ax, p[1] - ay), 0.0
+    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / L2
+    t = max(0.0, min(1.0, t))
+    return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy)), t
 
 
 def _curl(p_mcp, p_pip, p_dip, p_tip):
@@ -178,6 +211,24 @@ def compute_grip_metrics(lm, w, h):
     across = _norm(_sub(P[PINKY_MCP], P[INDEX_MCP]))
     out["thumb_side"] = _dot(_sub(P[THUMB_TIP], P[INDEX_MCP]), across) / palm
 
+    # 拇指尖到**食指折线**（根→尖三段）的最短距离，以及最近点落在食指哪一段。
+    #
+    # ⚠️ 为什么不用「拇指尖沿食指轴的投影」衡量位置：
+    #    食指一弯，MCP→食指尖 这条轴就转向侧面了，投影会变成负数、语义失效。
+    #    距离对弯曲免疫。这个坑是离线自检 C9/C10 抓出来的。
+    chain = (INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP)
+    segs = [(P[chain[i]], P[chain[i + 1]]) for i in range(3)]
+    lens = [_dist(a, b) for a, b in segs]
+    total = sum(lens) if sum(lens) > 1e-9 else 1e-9
+    best_d, best_pos, acc = None, None, 0.0
+    for (a, b), L in zip(segs, lens):
+        d, t = _seg_dist(P[THUMB_TIP], a, b)
+        if best_d is None or d < best_d:
+            best_d, best_pos = d, (acc + t * L) / total
+        acc += L
+    out["thumb_index_dist"] = best_d / palm
+    out["thumb_index_pos"] = best_pos
+
     out["thumb_index_angle"] = _angle_at(P[THUMB_MCP], P[INDEX_MCP], P[INDEX_PIP])
     return out
 
@@ -216,15 +267,17 @@ def view_quality(m, stability_px=None):
 # ---------------------------------------------------------------- 合成手（测试/演示）
 
 def synthetic_hand(curl=(0.55, 0.75, 0.80, 0.85), thumb_side=0.0,
-                   thumb_spread=1.0, scale=1.0, rot_deg=0.0, dx=0.0, dy=0.0):
+                   thumb_spread=1.0, thumb_along_shift=0.0,
+                   scale=1.0, rot_deg=0.0, dx=0.0, dy=0.0):
     """造一只可控的合成手，返回 21 个像素坐标。
 
     **只用于测试和演示，不参与运行时判定。** 存在的意义是：让"指标算得对不对"
     这件事可以离线验证 —— 不需要摄像头、不需要真的孩子配合。
 
-    curl         : 四指弯曲度 0(伸直)~1(蜷到底)，顺序 index/middle/ring/pinky
-    thumb_side   : 拇指横向偏移（正 = 往小指侧摆，模拟"包住食指"）
-    thumb_spread : 拇指远离食指的程度（越小越贴着食指）
+    curl             : 四指弯曲度 0(伸直)~1(蜷到底)，顺序 index/middle/ring/pinky
+    thumb_side       : 拇指横向偏移（正 = 往小指侧摆，模拟"包住食指"）
+    thumb_spread     : 拇指远离食指的程度（越小越贴着食指）
+    thumb_along_shift: 拇指沿食指方向平移（正 = 往食指尖方向伸）
     其余参数对整个手做刚性变换（用来验证指标的不变性）
 
     坐标系：+y 指向指尖方向，x 横跨手掌（负 = 拇指侧）。单位约等于掌宽。
@@ -267,11 +320,14 @@ def synthetic_hand(curl=(0.55, 0.75, 0.80, 0.85), thumb_side=0.0,
             cur = (cur[0] + d[0] * ln, cur[1] + d[1] * ln)
             pts[aidx] = cur
 
-    # 拇指：横向偏移 + 与食指的分开程度
+    # 拇指：横向偏移 + 与食指的分开程度 + 沿手指方向平移
+    # ⚠️ 平移必须用**纯 +y**，不能用「食指根→食指尖」那种带 x 分量的方向 ——
+    #    否则调 thumb_along_shift 时会顺带改变 thumb_side，两个参数被耦合，
+    #    "独立变化"的测试就没法做了。（离线自检 C10 专门盯这个耦合。）
     for aidx, k in ((THUMB_MCP, 0.5), (THUMB_IP, 0.75), (THUMB_TIP, 1.0)):
         x, y = pts[aidx]
         pts[aidx] = (x + thumb_side * k,
-                     y - (1.0 - thumb_spread) * 0.30 * k)
+                     y - (1.0 - thumb_spread) * 0.30 * k + thumb_along_shift * k)
 
     out = []
     for i in range(21):

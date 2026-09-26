@@ -31,16 +31,35 @@
 实时按键
 --------
     1  把当前这一帧记成「正确握笔」
-    2  把当前这一帧记成「拇指包食指」
-    3  把当前这一帧记成「拳握」
+    2  把当前这一帧记成「**拇指包食指**」（主要要抓的问题）
+    3  把当前这一帧记成「其他错误」（拳握等，留着免得污染「正确」那一类）
     r  清空已记录的数据，重来
     p  打印对照表（这一步才是重点）
     w  把已录的样本存成 json（方便发给别人复核）
+    z  开关「拇指-食指放大镜」（右下角）—— 判断包食指全靠那一块，务必盯它
     s  存一张当前画面
     q / ESC  退出
 
 ⚠️ 只在「视角合格」时才允许记录（手太小/抖动大会被拒绝并提示），
    因为在小样本上录出来的数据本身就没意义。
+
+判据说明（「拇指包住食指」到底看什么）
+------------------------------------
+不是看单一指标，而是两个合成：
+
+    thumb_side        拇指尖相对「食指根→小指根」横轴的偏移
+                      偏正 = 越到食指外侧 = 疑似包住
+    thumb_index_dist  拇指尖到**食指折线**的最短距离
+                      小 = 真的搭在食指上（不是悬在旁边）
+
+两个必须一起看：
+  · 只看 thumb_side —— 拇指伸得很长越过食指尖、或根本没搭上，也可能偏正，
+    但那是别的形态，纠正方式完全不同
+  · 只看距离 —— 分不清搭在食指的哪一侧（正常捏笔时拇指也贴着食指）
+
+⚠️ 这里原本用的是「拇指尖沿食指轴的投影」，被离线自检 C9/C10 否掉了：
+   食指一弯那条轴就转向侧面，投影会变成负数（实测 -0.166），语义失效。
+   改成「到折线的最近点」后天然落在 [0,1]，且对弯曲免疫。
 
 实现上避开的坑
 ------------
@@ -69,11 +88,19 @@ import pg_utils as pg            # noqa: E402  （相机、模型查找、阈值
 HAND_MODEL = "hand_landmarker.task"
 
 # 三组标签。键要能用键盘按，名要给家长看得懂。
+#
+# ⚠️ 按用户定的范围收窄过（2026-09-26）：
+#    主要就是纠正「大拇指包住食指」，所以第 2 类单独拿出来，
+#    对照表也重点比「正确 vs 包食指」。
+#    第 3 类留着不是凑数 —— 万一孩子的主要问题是别的（拳握等），
+#    有这一格才不会把那些样本误算进"正确"里污染结论。
 CLASSES = {
     "1": ("正确握笔", (60, 200, 60)),
-    "2": ("拇指包食指", (60, 60, 230)),
-    "3": ("拳握", (230, 160, 40)),
+    "2": ("拇指包食指", (60, 60, 230)),      # ← 主要要抓的问题
+    "3": ("其他错误", (230, 160, 40)),
 }
+
+FOCUS = ("1", "2")        # 对照表重点比较的两种；"3" 单独报
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
@@ -128,12 +155,11 @@ class Recorder:
                 if s.get(metric) is not None and not _isnan(s[metric])]
 
     def compare(self, min_n=5):
-        """核心：三组数据在每个指标上分不分得开。
+        """核心：看哪些指标能把「正确握笔」和「拇指包食指」分开。
 
-        判据（刻意保守）：把「正确」当一类、「两个错误」合并成另一类
-        —— 因为提醒逻辑要回答的就是"是不是正确"，不需要区分错误类型。
-        对每个指标算两类分布的范围重叠情况；再做一次真实阈值扫描
-        （复用坐姿项目的 suggest_threshold）给出误报/漏报数。
+        按用户定的范围收窄（2026-09-26）：主要问题就是「大拇指包住食指」，
+        所以主比较是 **1 正确 vs 2 包食指**；第 3 类「其他错误」单独列出作参考
+        （不参与可分性判断，但能看出孩子是不是还有别的问题）。
 
         返回 (文本报告, 可分性字典)
         """
@@ -142,42 +168,51 @@ class Recorder:
         counts = self.counts()
         lines.append("样本数：" + "  ".join(
             f"{CLASSES[k][0]}={counts[k]}" for k in CLASSES))
-        if counts["1"] < need or (counts["2"] + counts["3"]) < need:
-            lines.append(f"⚠️ 样本不够（「正确」至少 {need} 条、两个错误合计至少 {need} 条）")
-            lines.append("   多录一些再按 p —— 特别是每个类别要覆盖不同的手型和角度。")
+        miss = [k for k in FOCUS if counts[k] < need]
+        if miss:
+            lines.append("⚠️ 样本不够：" + "、".join(
+                f"{CLASSES[k][0]}（{counts[k]}/{need}）" for k in miss))
+            lines.append("   多录一些再按 p —— 每个类别都要覆盖不同的手型、角度、位置，")
+            lines.append("   只在一个位置录出来的高可分性是假的。")
             return "\n".join(lines), {}
 
-        metrics = [k for k in gm.METRIC_INFO
-                   if k not in ("px_w", "px_h", "palm_w", "hand_ratio")]
+        # 重点指标排前面：判断「拇指包食指」靠这两个合成判据
+        focus = list(gm.THUMB_OVER_INDEX_PAIR)
+        metrics = focus + [k for k in gm.METRIC_INFO
+                           if k not in ("px_w", "px_h", "palm_w", "hand_ratio")
+                           and k not in focus]
         sep = {}
+        has3 = counts["3"] > 0
         lines.append("")
-        lines.append(f"{'指标':<20}{'正确':>12}{'错误(合并)':>14}   可分性")
-        lines.append("-" * 68)
+        head = f"{'指标':<22}{'正确':>13}{'包食指':>13}"
+        lines.append(head + (f"{'其他错误':>13}" if has3 else "") + "   可分性")
+        lines.append("-" * (74 + (14 if has3 else 0)))
         for mt in metrics:
             a = self._col("1", mt)
-            b = self._col("2", mt) + self._col("3", mt)
+            b = self._col("2", mt)
             if len(a) < 2 or len(b) < 2:
                 continue
             ma, sa = float(np.mean(a)), float(np.std(a))
             mb, sb = float(np.mean(b)), float(np.std(b))
-            # 类间距离 / 类内离散：越大越分得开。用两类的合并标准差做尺度。
             pooled = max(1e-9, ((sa ** 2 + sb ** 2) / 2) ** 0.5)
             margin = abs(ma - mb) / pooled
             flag = "✅ 分得开" if margin >= 1.5 else (
                 "⚠️ 勉强" if margin >= 0.8 else "❌ 重叠")
             sep[mt] = margin
-            lines.append(f"{gm.METRIC_INFO[mt][0]:<20}"
-                         f"{ma:>8.3f}±{sa:.3f}{mb:>9.3f}±{sb:.3f}   "
-                         f"margin={margin:4.2f} {flag}")
+            row = (f"{gm.METRIC_INFO[mt][0]:<22}"
+                   f"{ma:>9.3f}±{sa:.3f}{mb:>9.3f}±{sb:.3f}")
+            if has3:
+                c = self._col("3", mt)
+                row += (f"{float(np.mean(c)):>9.3f}±{float(np.std(c)):.3f}"
+                        if len(c) >= 2 else f"{'—':>13}")
+            lines.append(row + f"   margin={margin:4.2f} {flag}")
 
-        # 对最好的那个指标做一次真实阈值扫描
         best = max(sep.items(), key=lambda kv: kv[1]) if sep else None
         if best and best[1] >= 1.5:
             mt = best[0]
-            should = self._col("2", mt) + self._col("3", mt)   # 应当报警
-            shouldnt = self._col("1", mt)                       # 不该报警
-            # 方向：如果"错误"的值比"正确"小，就取负号让语义统一成"越大越该报"
-            if np.mean(should) < np.mean(shouldnt):
+            shouldnt = self._col("1", mt)      # 不该报警
+            should = self._col("2", mt)        # 应当报警
+            if np.mean(should) < np.mean(shouldnt):   # 统一成"越大越该报"
                 should, shouldnt = [-x for x in should], [-x for x in shouldnt]
             r = pg.suggest_threshold(should, shouldnt)
             if r:
@@ -187,16 +222,19 @@ class Recorder:
                 lines.append(f"   建议阈值 {r['suggested']:.3f}："
                              f"误报 {r['fp_at_suggested']} / 漏报 {r['fn_at_suggested']}"
                              f"（共 {r['n_should'] + r['n_shouldnt']} 条样本）")
-                if r["fp_at_suggested"] + r["fn_at_suggested"] > 0:
-                    lines.append("   ⚠️ 还有分错的样本 —— 真实使用里这个指标单独用不够，"
-                                 "需要多指标组合，或者干脆放弃。")
+                if r["fp_at_suggested"] + r["fn_at_suggested"] == 0:
+                    lines.append("   ✅ 这一组样本上完全分开了 —— 但样本还少，"
+                                 "换位置 / 换光照再录一轮确认再说。")
+                else:
+                    lines.append("   ⚠️ 还有分错的样本 —— 单独用这一个指标不够，"
+                                 "要么做多指标组合，要么放弃。")
         else:
             lines.append("")
             lines.append("→ ⚠️ 没有任何指标 margin ≥ 1.5。")
             lines.append("   这**不一定**是代码问题 —— 也可能就是"
-                         "「手部关键点分辨不了握笔姿势」（文献预期如此）。")
-            lines.append("   建议：再多录些样本（换角度/换光照）确认一遍；"
-                         "若仍然重叠，就按 docs/04 §8 退回方案 E（握笔器）。")
+                         "「手部关键点分辨不了这个形态」。")
+            lines.append("   建议：换角度 / 光照再多录一轮确认；若仍然重叠，")
+            lines.append("   按 docs/01-plan.md §6 退回握笔器。")
         return "\n".join(lines), sep
 
 
@@ -207,7 +245,60 @@ def _isnan(v):
         return False
 
 
-def draw(frame, lm, m, quality, counts, note=""):
+def _zoom_thumb_index(frame, lm, size=210, pad=1.7):
+    """把「拇指-食指」区域放大后贴到右下角。
+
+    为什么要这个：判断孩子有没有「拇指包住食指」，**全靠这一小块区域的
+    几个关键点**（拇指尖 + 食指三段）。如果 MediaPipe 在这里跟错了，
+    看整张画面是完全看不出来的 —— 放大之后家长一眼就能确认
+    关键点到底有没有贴在手指上。
+
+    这一块是 occlusion 最容易出问题的地方（拇指压着食指），
+    所以它值得单独占一块屏幕。
+    """
+    import cv2
+    h, w = frame.shape[:2]
+    if lm is None:
+        return frame
+    idx = (gm.THUMB_MCP, gm.THUMB_TIP, gm.INDEX_MCP, gm.INDEX_PIP, gm.INDEX_TIP)
+    xs = [lm[i].x * w for i in idx]
+    ys = [lm[i].y * h for i in idx]
+    cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+    half = max(max(xs) - min(xs), max(ys) - min(ys)) * pad / 2.0
+    half = max(half, 25.0)
+    x0, y0 = int(max(0, cx - half)), int(max(0, cy - half))
+    x1, y1 = int(min(w, cx + half)), int(min(h, cy + half))
+    if x1 - x0 < 10 or y1 - y0 < 10:
+        return frame
+
+    crop = frame[y0:y1, x0:x1].copy()
+    for a, b in HAND_CONNECTIONS:
+        if a in idx and b in idx:
+            cv2.line(crop,
+                     (int(lm[a].x * w) - x0, int(lm[a].y * h) - y0),
+                     (int(lm[b].x * w) - x0, int(lm[b].y * h) - y0),
+                     (0, 220, 0), 2)
+    for i in idx:
+        px, py = int(lm[i].x * w) - x0, int(lm[i].y * h) - y0
+        cv2.circle(crop, (px, py), 4, (255, 255, 255), -1)
+    # 拇指尖单独标出来（它是这个判据的主角）
+    tx, ty = int(lm[gm.THUMB_TIP].x * w) - x0, int(lm[gm.THUMB_TIP].y * h) - y0
+    cv2.circle(crop, (tx, ty), 8, (60, 60, 255), 2)
+
+    crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_NEAREST)
+    cv2.rectangle(crop, (0, 0), (size - 1, size - 1), (0, 220, 0), 1)
+    cv2.putText(crop, "thumb-index ZOOM", (6, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 0), 1)
+    cv2.putText(crop, "check landmarks here", (6, size - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+    ox, oy = w - size - 10, h - size - 78
+    if ox > 0 and oy > 0:
+        frame[oy:oy + size, ox:ox + size] = crop
+    return frame
+
+
+def draw(frame, lm, m, quality, counts, note="", zoom=True):
     """画手部特写 + 指标。⚠️ 只能用 ASCII（OpenCV 写不了中文）。"""
     import cv2
     h, w = frame.shape[:2]
@@ -230,38 +321,46 @@ def draw(frame, lm, m, quality, counts, note=""):
         lines.append(("hand: not detected", qcolor["bad"]))
     lines.append((("view: " + quality.upper()), qcolor[quality]))
     lines.append(("--- metric candidates ---", (200, 200, 200)))
-    # 右侧：候选指标（第 1 关要比的就是这些数）
+    # 右侧：候选指标。重点那两个（判断「包食指」的合成判据）放最上面并加亮。
     right = []
     if m:
-        for k in ("fist", "curl_index", "tip_close", "spread",
-                  "thumb_index_gap", "thumb_side", "thumb_index_angle"):
+        order = list(gm.THUMB_OVER_INDEX_PAIR) + [
+            "thumb_index_gap", "thumb_index_angle",
+            "fist", "curl_index", "tip_close", "spread"]
+        for k in order:
             v = m.get(k)
             label = gm.METRIC_INFO[k][0]
             if v is None:
-                right.append(("%-14s   n/a" % label, (160, 160, 160)))
-            else:
-                col = (120, 220, 255)
-                if k == "thumb_side":
-                    col = (80, 80, 255) if v > 0.25 else col
-                right.append(("%-14s %7.3f" % (label, v), col))
+                right.append(("%-16s   n/a" % label, (160, 160, 160)))
+                continue
+            col = (120, 220, 255)
+            if k in gm.THUMB_OVER_INDEX_PAIR:
+                # 拇指越过量偏正 = 疑似包住食指 —— 变红提醒
+                if k == "thumb_side" and v > 0.25:
+                    col = (80, 80, 255)
+                else:
+                    col = (200, 255, 255)
+            right.append(("%-16s %7.3f" % (label, v), col))
 
     for i, (t, c) in enumerate(lines):
         cv2.putText(out, t, (12, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, c, 2)
     for i, (t, c) in enumerate(right):
-        cv2.putText(out, t, (w - 300, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(out, t, (w - 330, 26 + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, c, 1)
 
     # 底部：已录样本数 + 提示
     cnt = "  ".join(f"[{k}]{CLASSES[k][0][:2]}={counts[k]}" for k in CLASSES)
     cv2.putText(out, cnt, (12, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (255, 255, 255), 2)
-    cv2.putText(out, "1/2/3 record   p compare   r reset   w save   q quit",
+    cv2.putText(out, "1/2/3 record   p compare   r reset   w save   z zoom   q quit",
                 (12, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (180, 180, 180), 1)
     if note:
         cv2.putText(out, note, (12, h - 64), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (0, 200, 255), 2)
+    if zoom:
+        out = _zoom_thumb_index(out, lm)
     return out
 
 
@@ -275,12 +374,33 @@ def run_live(cam_idx, backend, out_dir):
     rec = Recorder()
 
     print(f"模型：{os.path.basename(model)}")
-    print("摆好机位后：先看左边 hand width 是否 ≥200px、view 是否 OK。")
-    print("然后让孩子分别摆出「正确握笔」「拇指包食指」「拳握」，每种按对应数字键多录几帧。")
-    print("录完按 p 看对照表 —— 那才是这个项目能不能做下去的依据。\n")
+    print("=" * 64)
+    print("实测步骤（按顺序做）")
+    print("=" * 64)
+    print("① 摆机位：桌面斜上方俯视手部，让手占画面主体。")
+    print("   先看左边三行：hand width 要 ≥200px、view 要是 OK。")
+    print("   view 显示 marginal/bad 时录不进样本（会被拒绝）—— 先把机位调好。")
+    print()
+    print("② 盯右下角的「拇指-食指放大镜」：确认关键点确实贴在小手上。")
+    print("   拇指尖画的是红圈。如果红圈飘在手指外面，说明这个角度跟不住，")
+    print("   换另一侧试试（z 键可以开关放大镜）。")
+    print()
+    print("③ 让孩子分别摆出下面三种，每种按对应数字键录 5~10 帧：")
+    print("     1 = 正确握笔     2 =【拇指包食指】（主要要抓的）   3 = 其他错误")
+    print("   ⚠️ 每种都要换 2~3 个位置各录一遍（画面中间/偏左/偏右），")
+    print("      只在一个位置录出来的高可分性是假的。")
+    print()
+    print("④ 按 p 出对照表 —— 那才是这个项目能不能做下去的依据。")
+    print("   重点看「正确」和「包食指」那两列的差，以及 margin 后面的标记：")
+    print("      ✅ 分得开(≥1.5)   ⚠️ 勉强(0.8~1.5)   ❌ 重叠(<0.8)")
+    print()
+    print("⑤ 按 w 把样本存成 json（留在 hand_probe\\ 目录，方便回看/发我复核）。")
+    print("=" * 64)
+    print()
 
     tick = 0
     last_note = 0.0
+    zoom = True        # 拇指-食指放大镜，z 键切换
     while True:
         fr = pg.grab_frame(cap)
         if fr is None:
@@ -298,13 +418,16 @@ def run_live(cam_idx, backend, out_dir):
         rec.last = (m, quality)
 
         note = rec.note if time.time() - last_note < 2.5 else ""
-        cv2.imshow("pen grip probe  (1/2/3 record  p compare  q quit)",
-                   draw(fr, lm, m, quality, rec.counts(), note))
+        cv2.imshow("pen grip probe  (1/2/3 record  p compare  z zoom  q quit)",
+                   draw(fr, lm, m, quality, rec.counts(), note, zoom=zoom))
         k = cv2.waitKey(1) & 0xFF
         key = chr(k) if 0 <= k < 128 else ""
 
         if k in (ord("q"), 27):
             break
+        elif key == "z":
+            zoom = not zoom
+            print(f"  拇指-食指放大镜：{'开' if zoom else '关'}")
         elif key in CLASSES:
             if quality != "ok":
                 # ⚠️ 视角不合格就拒绝记录。在手太小/抖得厉害的帧上录下来的
@@ -437,15 +560,21 @@ def selftest():
     hand.close()
     print(f"手部推理：{sum(ts) / len(ts):.1f} ms/帧（空图，成本下限）")
 
-    # 用合成手走一遍「记录 -> 对照表」全流程，确认逻辑不崩
+    # 用合成手走一遍「记录 -> 对照表」全流程，确认逻辑不崩。
+    # ⚠️ 每类都加了抖动 —— 不给抖动的话类内标准差是 0，margin 会被算成
+    #    134 这种荒唐值，看着像"完美可分"，其实只是人造数据太干净。
     rec = Recorder()
-    for _ in range(6):
+    rng = np.random.default_rng(0)
+    for _ in range(8):
+        j = lambda: float(rng.normal(0, 0.06))          # noqa: E731
         rec.record("1", gm.compute_grip_metrics(*gm.synthetic_landmarks(
-            curl=(0.2, 0.6, 0.7, 0.75), thumb_side=-0.3)))
+            curl=(0.2, 0.6, 0.7, 0.75),
+            thumb_side=-0.35 + j(), thumb_along_shift=0.0 + j())))
         rec.record("2", gm.compute_grip_metrics(*gm.synthetic_landmarks(
-            curl=(0.2, 0.6, 0.7, 0.75), thumb_side=+0.6)))
+            curl=(0.2, 0.6, 0.7, 0.75),
+            thumb_side=+0.45 + j(), thumb_along_shift=0.15 + j())))
         rec.record("3", gm.compute_grip_metrics(*gm.synthetic_landmarks(
-            curl=(1.0, 1.0, 1.0, 1.0), thumb_side=0.0)))
+            curl=(1.0, 1.0, 1.0, 1.0), thumb_side=0.0 + j())))
     report, sep = rec.compare()
     print(report)
     print("\n✅ 自检通过（模型可用、记录/对照流程可跑）")

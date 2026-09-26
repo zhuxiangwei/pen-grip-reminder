@@ -37,77 +37,100 @@
 
 | 项目 | 状态 |
 |---|---|
-| 指标算法 | ✅ 完成，离线自检全部通过 |
-| 对照实验工具 | ✅ 完成 |
+| 指标算法 | ✅ 完成，离线自检 **52/52** 通过 |
+| 对照实验工具 | ✅ 完成（含拇指-食指放大镜） |
+| 运行环境 | ✅ 已建好（`envs/pg`），环境自检 + 摄像头均通过 |
 | **第 0 关实测（真实摄像头）** | ⏳ **待做 —— 需要你** |
-| **第 1 关实测（三种握法对照）** | ⏳ **待做 —— 需要你和孩子** |
+| **第 1 关实测（正确 vs 包食指对照）** | ⏳ **待做 —— 需要你和孩子** |
 | 界面 / 语音 / 提醒 | 🚫 故意未开始 |
+
+### 已确定的范围（2026-09-26）
+
+1. **固定一个检测角度**（不做多机位自适应）
+2. **主要只纠正「大拇指包住食指」** —— 问题从"多类握法识别"收窄成**二分类**，
+   判据从撒网 6+ 个指标收敛成一对：
+
+   | 指标 | 含义 |
+   |---|---|
+   | `thumb_side` | 拇指尖相对「食指根→小指根」横轴的偏移（正 = 越过） |
+   | `thumb_index_dist` | 拇指尖到**食指折线**的最短距离（小 = 真的搭上去） |
+
+   两个必须一起看：只看前者会把"拇指伸过食指尖"也算进来；
+   只看后者分不清搭在食指哪一侧（正常捏笔时拇指也贴着食指）。
+
+⚠️ **机位侧别见 `docs/01-plan.md` §1.1**：从拇指那一侧拍，拇指会挡住食指 ——
+而"有没有压过食指"恰恰要看食指。**选错侧不是精度差一点，是信息被遮住了。**
 
 ---
 
 ## 怎么跑
 
-### 1. 环境
+### 1. 环境（已经建好了）
 
-依赖很少（只有 opencv + mediapipe + numpy）。可以直接复用坐姿项目的 venv：
-
-```bash
-..\posture-reminder\envs\posture\Scripts\python.exe --version
-```
-
-或者自己建（步骤和理由见 `requirements.txt`）：
+本项目的 venv 在 **`envs\pg\`**，依赖都装好了。先跑一次环境自检
+（**连摄像头一起验**，坐下之前就知道有没有问题）：
 
 ```bash
-python -m venv envs\pg
-envs\pg\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple opencv-python
-envs\pg\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple mediapipe
-envs\pg\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple absl-py certifi flatbuffers numpy
+envs\pg\Scripts\python.exe tools\check_env.py
 ```
+
+自检会报四项：依赖包 / 模型 / 推理耗时 / 摄像头分辨率。
+
+> 要重建环境（或者换台机器）就照 `requirements.txt` 里的四条 pip 命令抄。
+> ⚠️ 那里写了三个坑：**matplotlib 是 mediapipe 的硬依赖不能省**、
+> mediapipe 要 `--no-deps` 装、用 Python 3.12 别用 3.13。
 
 ### 2. 下模型
 
 ```bash
-python tools\fetch_models.py
+envs\pg\Scripts\python.exe tools\fetch_models.py
 ```
+
+模型约 7.5MB，**没有放进仓库**，用脚本按需下载。（本地已经下好了。）
 
 ### 3. 第 0 关：先确认看得见（0 成本）
 
 拿手机拍一张孩子握笔的照片，或把手机装在桌上当摄像头：
 
 ```bash
-python hand_probe.py --image D:\握笔照片.jpg
-python hand_probe.py --camera 0
+envs\pg\Scripts\python.exe hand_probe.py --image D:\握笔照片.jpg
+envs\pg\Scripts\python.exe hand_probe.py --camera 0
 ```
 
 看画面左侧两个数：**hand width ≥200px**、**view: OK**。
 
 ### 4. 第 1 关：对照实验（重点）
 
+**直接双击 `实测握笔.bat`**，或：
+
 ```bash
-python hand_probe.py --camera 0
+envs\pg\Scripts\python.exe hand_probe.py --camera 0
 ```
 
-按键：
+程序启动时会打印一份分步指引。按键：
 
 | 键 | 作用 |
 |---|---|
-| `1` / `2` / `3` | 把当前帧记成「正确握笔」/「拇指包食指」/「拳握」 |
+| `1` / `2` / `3` | 把当前帧记成「正确握笔」/「**拇指包食指**」/「其他错误」 |
 | `p` | **打印对照表** |
+| `z` | 开关右下角「拇指-食指放大镜」 |
 | `r` | 清空重来 |
 | `w` | 存样本 json |
 | `s` | 存一张标注画面 |
 | `q` | 退出 |
 
-**实验要点**：每种握法录 5~10 帧，而且**要换 3 个位置各录一遍**
-（画面中央、偏左、偏右）。只在一个位置录出来的高可分性是假的 ——
-那可能只是在认位置，不是在认握法。
+**实验要点**：
 
-⚠️ 只在 `view: OK` 时才接受记录。手太小/抖得厉害时录的样本没意义，会被拒绝。
+- 每种握法录 5~10 帧，而且**要换 3 个位置各录一遍**（画面中央、偏左、偏右）。
+  只在一个位置录出来的高可分性是假的 —— 那可能只是在认位置，不是在认握法。
+- ⚠️ 只在 `view: OK` 时才接受记录。手太小/抖得厉害时录的样本没意义，会被拒绝。
+- 盯右下角的**放大镜**：判断「有没有包住食指」全靠那一小块区域的几个点。
+  如果红圈（拇指尖）飘在手指外面，说明这个角度跟不住，换一侧再试。
 
 ### 5. 算法自检（不需要摄像头）
 
 ```bash
-python tests\test_grip_offline.py
+envs\pg\Scripts\python.exe tests\test_grip_offline.py
 ```
 
 ---
@@ -116,14 +139,20 @@ python tests\test_grip_offline.py
 
 ```
 pen-grip-reminder/
+├── 实测握笔.bat                双击开始实测（自动检查环境和模型）
+├── 推送到GitHub.bat
 ├── grip_metrics.py            核心：21 个手部点 -> 候选指标（纯函数，可离线测）
 ├── pg_utils.py                相机/模型/阈值工具（自包含）
 ├── hand_probe.py              对照实验工具（视角门控 + 记录分类 + 出对照表）
-├── tests/test_grip_offline.py 指标算法自检
-├── tools/fetch_models.py      下模型
+├── tests/test_grip_offline.py 指标算法自检（52 项）
+├── tools/
+│   ├── check_env.py           环境自检（依赖/模型/推理/摄像头）
+│   ├── fetch_models.py        下模型
+│   └── push_to_github.py      推送
 ├── docs/
 │   ├── 00-feasibility.md      可行性评估（含文献数据、方案对比）
-│   └── 01-plan.md             实施计划（里程碑、实验协议、退路）
+│   └── 01-plan.md             实施计划（里程碑、实验协议、机位选择、退路）
+├── envs/pg/                   虚拟环境（不入库）
 └── bench/models/              模型（不入库）
 ```
 

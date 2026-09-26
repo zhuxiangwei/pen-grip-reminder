@@ -1,36 +1,46 @@
 # 握笔姿势提醒 · 运行依赖
 #
-# ⚠️ 三个必须知道的点
+# ⚠️ 四个必须知道的点（都是实测踩出来的）
 #
-# ── 1. 必须用**系统 Python**（带 tkinter 的那个）
-#    便携版 Python 不含 tkinter。本项目界面还没做（阶段 3 才做），
-#    但环境固定用系统 Python，避免以后踩：
-#      C:\Users\tmpee\AppData\Local\Programs\Python\Python312\python.exe
+# ── 1. **matplotlib 是硬依赖，不能省**
+#    mediapipe 1.0.1 在 **import 阶段**就 import 它
+#    （`tasks/python/vision/drawing_utils.py` 第 21 行直接 `import matplotlib.pyplot`）。
+#    少了它报 `ModuleNotFoundError: No module named 'matplotlib'`，
+#    但要翻到 mediapipe 内部的 traceback 才看得出来，看着像模型或代码的问题。
+#    （这个坑踩过一次：写这份清单时漏了它，跑端到端自检才发现。）
 #
-# ── 2. mediapipe 必须 `--no-deps` 安装，并**跳过 opencv-contrib-python**
+# ── 2. mediapipe 必须 `--no-deps` 安装，跳过 opencv-contrib-python
 #    它声明依赖 opencv-contrib-python，与 opencv-python 同时提供 cv2，
 #    pip 替换时会删除几千个文件 —— 在受限环境下会撞上批量删除护栏而中断。
-#    opencv-python 已经够用（已实测）。pip 事后报的
+#    opencv-python 已经够用（实测通过）。pip 事后报的
 #    "mediapipe requires opencv-contrib-python" 提示可忽略。
 #
-# ── 3. 国内直连 PyPI 会很慢甚至卡死，务必带 -i 走镜像
+# ── 3. 用 Python 3.12，不要用 3.13
+#    mediapipe 的 wheel 对 3.13 支持不稳。本机用的是
+#    C:\Users\tmpee\AppData\Local\Programs\Python\Python312\python.exe
 #
-# 安装步骤（照抄）：
+# ── 4. 国内直连 PyPI 会很慢甚至卡死，务必带 -i 走镜像
+#
+# 安装步骤（照抄即可）：
 #   python -m venv envs\pg
 #   envs\pg\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple opencv-python
 #   envs\pg\Scripts\python.exe -m pip install --no-deps -i https://pypi.tuna.tsinghua.edu.cn/simple mediapipe
-#   envs\pg\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple absl-py certifi flatbuffers numpy
+#   envs\pg\Scripts\python.exe -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple absl-py certifi flatbuffers numpy matplotlib
 #
-# 也可以直接复用坐姿项目的 venv（依赖完全覆盖）：
-#   ..\posture-reminder\envs\posture\Scripts\python.exe
+# 装完先跑环境自检（连摄像头一起验）：
+#   envs\pg\Scripts\python.exe tools\check_env.py
 #
-# ── 实测版本（本机 Windows 10 / Python 3.12.10）
+# ⚠️ 不要再依赖坐姿项目的 venv。握笔是独立项目，本来就该有自己的环境 ——
+#    而且那个目录已经不存在了（2026-09-26）。
+#
+# ── 实测版本（2026-09-26 本机 Windows / Python 3.12.10）
 
-opencv-python==5.0.0.93     # 只用它读摄像头和画预览；不装 opencv-contrib
+opencv-python==5.0.0.93     # 读摄像头、画预览；**不装** opencv-contrib
 mediapipe==1.0.1            # ⚠️ 1.0 已移除 mp.solutions，只能用 Tasks API
 numpy==2.5.3
+matplotlib==3.11.2          # ⚠️ mediapipe import 阶段就依赖它，不能省
 
-# mediapipe 的其余依赖（由 --no-deps 安装后手动补齐）
+# mediapipe 的其余依赖（--no-deps 装完后手动补齐）
 absl-py==2.5.0
 certifi==2026.7.22
 flatbuffers==25.12.19
@@ -39,3 +49,4 @@ flatbuffers==25.12.19
 # PySide6==6.11.2           # 图形界面
 # soundfile==0.14.0         # 语音 mp3->wav 转换
 # edge-tts==7.2.8           # 语音片段生成
+# sounddevice==0.5.6        # 已装，留给阶段 3
