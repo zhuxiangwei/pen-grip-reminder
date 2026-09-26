@@ -149,7 +149,8 @@ def test_invariance():
     moved = metrics(dx=400.0, dy=-250.0)
     scaled = metrics(scale=2.7)
     for k in ("fist", "tip_close", "spread", "thumb_index_gap", "thumb_side",
-              "thumb_index_dist", "thumb_index_pos", "thumb_index_angle"):
+              "thumb_index_dist", "thumb_index_pos", "thumb_index_angle",
+              "palm_view_angle"):
         close(f"B1 平移后 {k} 不变", moved[k], base[k], 1e-9)
         close(f"B2 放大 2.7 倍后 {k} 不变", scaled[k], base[k], 1e-9)
 
@@ -187,7 +188,7 @@ def test_mirror():
 
     for k in ("fist", "curl_index", "tip_close", "spread", "thumb_index_gap",
               "thumb_side", "thumb_index_dist", "thumb_index_pos",
-              "thumb_index_angle"):
+              "thumb_index_angle", "palm_view_angle"):
         close(f"B2 镜像后 {k} 不变", mirror[k], normal[k], 1e-9)
 
     # 逐条确认：thumb_side 在镜像下确实不变（这是"左右手通吃"的关键）
@@ -335,6 +336,43 @@ def test_view_gate():
     case("E6 抖动过大时把 ok 降级为 marginal", lv_j, "marginal")
 
 
+# ---------------------------------------------------------------- F. 视角角
+
+def test_view_angle():
+    """视角角：判断「从哪个方向看手」。
+
+    ⚠️ 这是用户实测逼出来的判据：原本的机位是从拇指侧平着看，
+       要看的食指被拇指挡住。"改成俯视"能解决，但"够不够俯"光靠感觉说不准。
+       手掌平面上的两条基本正交轴（食指根→小指根、手腕→中指根），
+       从正上方看时接近垂直；在手掌平面内平视时会塌向 0°/180°。
+    """
+    print("\n[F] 视角角（判断从哪个方向看手）")
+
+    m = metrics()
+    a = m["palm_view_angle"]
+    ok_("F1 合成手（模拟从上方看）的视角角接近 90°——判 GOOD",
+        gm.palm_view_verdict(m)[0] == "ok", f"角度 {a:.1f}°")
+
+    # 旋转不变：两条轴一起刚性旋转，夹角不变
+    for deg in (25.0, -40.0, 90.0):
+        close(f"F2 旋转 {deg:.0f}° 后视角角不变",
+              metrics(rot_deg=deg)["palm_view_angle"], a, 1e-6)
+
+    # 判据分档
+    case("F3 90° -> ok", gm.palm_view_verdict({"palm_view_angle": 90.0})[0], "ok")
+    case("F4 65° -> ok（与 90 差 25）",
+         gm.palm_view_verdict({"palm_view_angle": 65.0})[0], "ok")
+    case("F5 45° -> marginal（差 45）",
+         gm.palm_view_verdict({"palm_view_angle": 45.0})[0], "marginal")
+    case("F6 15° -> bad（几乎在手掌平面内看）",
+         gm.palm_view_verdict({"palm_view_angle": 15.0})[0], "bad")
+    case("F7 165° -> bad（另一个方向的平面内）",
+         gm.palm_view_verdict({"palm_view_angle": 165.0})[0], "bad")
+    case("F8 没数据 -> bad", gm.palm_view_verdict(None)[0], "bad")
+    case("F9 值为 None -> bad",
+         gm.palm_view_verdict({"palm_view_angle": None})[0], "bad")
+
+
 # ---------------------------------------------------------------- 入口
 
 def main():
@@ -347,6 +385,7 @@ def main():
     test_directions()
     test_degenerate()
     test_view_gate()
+    test_view_angle()
 
     print("\n" + "=" * 62)
     if FAIL:

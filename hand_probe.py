@@ -519,7 +519,23 @@ def draw(frame, lm, m, quality, counts, note="", zoom=True,
         lines.append(("hand: not detected", qcolor["bad"]))
     lines.append((("view: " + quality.upper()), qcolor[quality]))
 
-    # 指标稳定性 —— 这是判断「这个角度到底行不行」的量化依据
+    # 视角角：决定「横向的拇指-食指关系看不看得见」。越接近 90° 越好。
+    # ⚠️ 这条是用户实测逼出来的：原机位从拇指侧平着看，食指被挡住。
+    #    "改成俯视"能解决，但"够不够俯"靠感觉说不准 —— 这个角度能算出来。
+    if m is not None:
+        va = m.get("palm_view_angle")
+        vlv, _vmsg = gm.palm_view_verdict(m)
+        if va is None:
+            lines.append(("palm view: n/a", (0, 0, 255)))
+        else:
+            lines.append((f"palm view: {va:5.1f} deg",
+                          {"ok": (0, 200, 0), "marginal": (0, 180, 255),
+                           "bad": (0, 0, 255)}[vlv]))
+            if vlv != "ok":
+                lines.append(("  -> raise the camera!", (0, 180, 255)
+                              if vlv == "marginal" else (0, 0, 255)))
+
+    # 指标稳定性 —— 判断「这个角度到底行不行」的第二个量化依据
     # ⚠️ 姿势没变时这两个指标的 std 应该很小。std 大 = 模型在猜被挡住的点。
     #    掌心可能很稳（手没动），所以只看掌心抖动发现不了这个问题。
     s0, s1 = focus_std
@@ -608,22 +624,25 @@ def run_live(cam_idx, backend, out_dir):
     print("=" * 64)
     print("实测步骤（按顺序做）")
     print("=" * 64)
-    print("① 摆机位：桌面斜上方俯视手部，让手占画面主体。")
-    print("   先看左边三行：hand width 要 ≥200px、view 要是 OK。")
-    print("   view 显示 marginal/bad 时录不进样本（会被拒绝）—— 先把机位调好。")
+    print("① 摆机位：**正面俯视** —— 摄像头在孩子前方稍高处，"
+          "以 45~60° 俯角往下看手。")
+    print("   ⚠️ 别摆成 90° 正俯：笔杆是往后倒的，正上方会被笔杆挡住手背。")
+    print("   ⚠️ 也别平着从侧面看：横向的拇指-食指关系会被压扁")
+    print("      （这正是之前从拇指侧平视失败的原因）。")
     print()
-    print("   ⚠️ 你的机位（电脑在孩子左边、镜头朝右）是从【拇指那一侧】看右手。")
-    print("      而判断「拇指有没有压过食指」必须看得见【食指】——")
-    print("      从拇指侧平着看，食指会被拇指挡住，模型只能猜。")
-    print("      对策：**把摄像头抬高，让它以 45~60° 俯角往下看手**。")
-    print("      有了俯视分量，才看得见拇指和食指的左右关系。")
-    print("      如果抬高还是不行，再考虑把摄像头挪到孩子**右侧**（小指那一侧）。")
+    print("   先看左边这几行，**三个都要达标**，否则录不进样本（会被拒绝）：")
+    print("      hand width   >= 200px      手够大")
+    print("      view         =  OK          综合视角合格")
+    print("      palm view    ≈  90°         够不够俯 —— 这个数直接告诉你")
     print()
-    print("   怎么判断行不行？看左边那行 `metric stability`：")
-    print("      GOOD = 姿势稳住时指标很稳，这个角度可用")
-    print("      FAIR = 勉强")
-    print("      POOR = 指标在乱跳，说明角度不行，**必须换角度再录**")
-    print("   （姿势没变却跳，就是模型在猜被挡住的点 —— 录出来的数据不能用。）")
+    print("   `palm view` 是怎么算的：手掌平面上两条基本正交的轴")
+    print("   （食指根→小指根、手腕→中指根），从上方看时接近垂直；")
+    print("   在手掌平面内平视会塌向 0/180°。所以 90° ≈ 正上方俯视，越小越平。")
+    print()
+    print("   还有两个辅助判断：")
+    print("      metric stability  GOOD=指标很稳  POOR=模型在猜被挡住的点，")
+    print("                        这个角度**不可用**，换角度再录")
+    print("      右下角放大镜       红圈是拇指尖，看它和食指的点有没有贴住手指")
     print()
     print("② 盯右下角的「拇指-食指放大镜」：确认关键点确实贴在小手上。")
     print("   拇指尖画的是红圈。如果红圈飘在手指外面，说明这个角度跟不住，")
@@ -772,6 +791,289 @@ def run_live(cam_idx, backend, out_dir):
     return rec
 
 
+def run_video(path, out_dir):
+    """分析一段**录像**（不用推流，手机架好录一段就行）。
+
+    为什么加这个模式（用户实测的硬件约束）：
+      笔记本**内置摄像头做不到俯视** —— 它在屏幕顶部边框里，
+      光轴垂直于屏幕朝着使用者；正常打开时摄像头是**略微朝上**的，
+      看到的是人脸不是桌面。要朝下 45° 就得把屏幕压向键盘，屏幕就没法看了。
+      所以俯视必须靠**手机或外接 USB 摄像头**架在桌面上方。
+
+      但"把手机当网络摄像头推流"有额外配置成本。这个模式绕开它：
+      手机架好、录一段、传到电脑、直接分析。
+
+    按键
+    ----
+        空格        播放 / 暂停（**打开时默认暂停**，方便先看清画面）
+        .  /  ,     前进 / 后退一帧
+        [  ]        锁定画面左半 / 右半那只手为被测手
+        \\           取消锁定
+        1 2 3       把当前帧记成 正确 / 拇指包食指 / 其他错误
+        p 对照表    w 存样本    z 放大镜    s 存图    q 退出
+    """
+    import cv2
+    import mediapipe as mp
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        sys.exit(f"打不开这个视频：{path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    hand = make_hand(pg.find_model(HAND_MODEL))
+    rec = Recorder()
+    cfg = load_cfg()
+    sels = HandSelector(lock=cfg.get("hand_lock"))
+
+    print(f"视频：{os.path.basename(path)}  {total} 帧  {fps:.1f} fps")
+    print("默认**暂停**。先按空格播放，或按 . 逐帧看。")
+    print("确认左边 hand width / view / palm view 达标、且 MEASURING 在写字的手上，")
+    print("再按 1 / 2 录样本。按 p 出对照表。\n")
+
+    idx = 0
+    paused = True
+    zoom = True
+    tick = 0
+    last_note = 0.0
+    frame = None
+
+    def goto(i):
+        i = max(0, min(total - 1, i)) if total else max(0, i)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ok, fr = cap.read()
+        return i, (fr if ok else None)
+
+    while True:
+        if frame is None:
+            idx, frame = goto(idx)
+            if frame is None:
+                print("  读到末尾了")
+                break
+        h, w = frame.shape[:2]
+        rgb = frame[:, :, ::-1].copy()
+        tick += 33
+        r = hand.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), tick)
+
+        hands = []
+        for i, h_lm in enumerate(r.hand_landmarks or []):
+            hd = "?"
+            if r.handedness and i < len(r.handedness) and r.handedness[i]:
+                cat = r.handedness[i][0]
+                hd = getattr(cat, "category_name", None) or "?"
+            hands.append((h_lm, hd))
+
+        sel = sels.update(hands, w, h)
+        lm = hands[sel][0] if sel is not None else None
+        m = gm.compute_grip_metrics(lm, w, h) if lm is not None else None
+        rec.add_center(m, lm, w, h)
+        rec.add_focus(m)
+        quality, qmsg = gm.view_quality(m, rec.jitter)
+
+        note = rec.note if time.time() - last_note < 2.5 else ""
+        vis = draw(frame, lm, m, quality, rec.counts(), note, zoom=zoom,
+                   hands=hands, sel=sel,
+                   sel_lines=sels.label(hands, sel, w, h),
+                   lock=sels.lock, focus_std=rec.focus_std)
+        cv2.putText(vis, f"frame {idx}/{total}  {'PAUSED' if paused else 'PLAY'}",
+                    (12, h - 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 220, 255), 2)
+        cv2.imshow("pen grip probe - VIDEO MODE  (space=play  ./,=step)", vis)
+
+        k = cv2.waitKey(0 if paused else int(1000 / max(1.0, fps))) & 0xFF
+        key = chr(k) if 0 <= k < 128 else ""
+
+        if k in (ord("q"), 27):
+            break
+        elif k == ord(" "):
+            paused = not paused
+        elif key in (".", ">", "l"):
+            paused = True
+            idx, frame = goto(idx + 1)
+            continue
+        elif key in (",", "<", "j"):
+            paused = True
+            idx, frame = goto(idx - 1)
+            continue
+        elif key == "z":
+            zoom = not zoom
+        elif key in ("[", "]"):
+            sels.lock = "screen_left" if key == "[" else "screen_right"
+            cfg["hand_lock"] = sels.lock
+            save_cfg(cfg)
+            print(f"  ✓ 已锁定：{'画面左半' if key == '[' else '画面右半'}那只（已记住）")
+        elif key == "\\":
+            sels.lock = None
+            cfg.pop("hand_lock", None)
+            save_cfg(cfg)
+            print("  ✓ 已取消锁定")
+        elif key in CLASSES:
+            if sel is None:
+                print(f"  ✗ 拒绝记录：{sels.note}（按 [ 或 ] 指定）")
+            elif quality != "ok":
+                print(f"  ✗ 拒绝记录（{CLASSES[key][0]}）：{qmsg}")
+            else:
+                rec.record(key, m)
+                print(f"  ✓ 记录 {CLASSES[key][0]}（共 {rec.counts()[key]} 条）"
+                      f"  帧 {idx}  {_brief(m)}")
+            rec.note = f"recorded {key}"
+            last_note = time.time()
+        elif key == "p":
+            report, _ = rec.compare()
+            print("\n" + "=" * 68 + "\n" + report + "\n" + "=" * 68 + "\n")
+            rec.note = "report -> console"
+            last_note = time.time()
+        elif key == "w":
+            print(f"  已保存 {save_samples(rec, out_dir)}")
+        elif key == "s":
+            os.makedirs(out_dir, exist_ok=True)
+            p = os.path.join(out_dir, time.strftime("video_%Y%m%d-%H%M%S.jpg"))
+            cv2.imwrite(p, vis)
+            print(f"  已存 {p}")
+
+        if not paused:
+            idx += 1
+            frame = None
+
+    cap.release()
+    cv2.destroyAllWindows()
+    hand.close()
+    cnt = rec.counts()
+    print("\n=== 退出小结 ===")
+    print("  样本数：" + "  ".join(f"{CLASSES[k][0]}={cnt[k]}" for k in CLASSES))
+    if sum(cnt.values()) >= 10:
+        print(f"  重新出表：python hand_probe.py --replay <用 w 存的文件>")
+    return rec
+
+
+def scan_video(path, every=3):
+    """不弹窗口、不交互，直接报告整段录像的机位质量。
+
+    用途：**录完先跑这个**，快速确认「手够不够大、角度对不对、跟得稳不稳」，
+    不用把整段视频从头看到尾。机位不合格就别费劲逐帧录样本了。
+
+    ⚠️ 为什么需要它：笔记本做俯视时盖子要压下去、**屏幕根本看不见**，
+    所以只能盲录。盲录完最需要的就是一个"不用看图"的体检报告。
+    """
+    import cv2
+    import mediapipe as mp
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        sys.exit(f"打不开这个视频：{path}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    hand = make_hand(pg.find_model(HAND_MODEL))
+    sels = HandSelector(lock=load_cfg().get("hand_lock"))
+    rec = Recorder()
+
+    print("=" * 64)
+    print(f"扫描：{os.path.basename(path)}   {total} 帧  {fps:.1f} fps"
+          f"   （每 {every} 帧取一帧）")
+    print("=" * 64)
+
+    tick = 0
+    n = 0
+    got = 0
+    multi = 0
+    widths = []
+    angles = []
+    qcount = {"ok": 0, "marginal": 0, "bad": 0}
+    stab = {"good": 0, "fair": 0, "poor": 0}
+
+    while True:
+        ok, fr = cap.read()
+        if not ok or fr is None:
+            break
+        n += 1
+        if n % every:
+            continue
+        h, w = fr.shape[:2]
+        tick += 33
+        r = hand.detect_for_video(mp.Image(
+            image_format=mp.ImageFormat.SRGB, data=fr[:, :, ::-1].copy()), tick)
+        hands = [(h_lm, "?") for h_lm in (r.hand_landmarks or [])]
+        if len(hands) > 1:
+            multi += 1
+        if not hands:
+            continue
+        sel = sels.update(hands, w, h)
+        if sel is None:
+            continue
+        lm = hands[sel][0]
+        m = gm.compute_grip_metrics(lm, w, h)
+        got += 1
+        widths.append(m["px_w"])
+        if m["palm_view_angle"] is not None:
+            angles.append(m["palm_view_angle"])
+        qc = gm.view_quality(m)[0]
+        qcount[qc] = qcount.get(qc, 0) + 1
+        rec.add_focus(m)
+        s0, s1 = rec.focus_std
+        if s0 is not None:
+            worst = max(s0 / 0.08, (s1 or 0) / 0.05)
+            stab["good" if worst < 1.0 else
+                 ("fair" if worst < 2.0 else "poor")] += 1
+
+    cap.release()
+    hand.close()
+    processed = max(1, len(widths))
+
+    print(f"\n取帧数        {n}")
+    print(f"检到手        {got} 帧（{got / max(1, n) * 100:.0f}%）")
+    print(f"同时两只手     {multi} 帧"
+          f"{'  ← 左手也在画面里，属正常' if multi else ''}")
+    if not widths:
+        print("\n❌ 全程没检到可用的手。先解决：")
+        print("   1. 手在不在画面里？（盖子压下去后角度变了，很容易拍到别处）")
+        print("   2. 剪一段有手的重录，或把笔记本挪近/调盖子角度")
+        print("   3. 用 tools\\record.py 录完先看它存的快照 jpg")
+        return 1
+
+    widths.sort()
+    print(f"\n手部像素宽    平均 {sum(widths) / len(widths):.0f}px   "
+          f"中位 {widths[len(widths) // 2]:.0f}px   "
+          f"最小 {widths[0]:.0f}  最大 {widths[-1]:.0f}")
+    ok_px = sum(1 for x in widths if x >= gm.HAND_PX_OK)
+    print(f"  ≥{gm.HAND_PX_OK:.0f}px 的比例   {ok_px / processed * 100:.0f}%")
+    if angles:
+        print(f"\n手掌视角角    平均 {sum(angles) / len(angles):.1f}°"
+              f"   （90° = 从正上方看手；越小越接近平视）")
+        aok = sum(1 for a in angles if abs(90 - a) <= gm.PALM_ANGLE_OK)
+        print(f"  合格比例       {aok / len(angles) * 100:.0f}%")
+    print(f"\n视角判定       ok {qcount['ok']}   marginal {qcount['marginal']}"
+          f"   bad {qcount['bad']}")
+    print(f"指标稳定性     GOOD {stab['good']}   FAIR {stab['fair']}"
+          f"   POOR {stab['poor']}")
+
+    print("\n" + "-" * 64)
+    bad = []
+    if ok_px / processed < 0.8:
+        bad.append(f"手不够大（只有 {ok_px / processed * 100:.0f}% 的帧 ≥{gm.HAND_PX_OK:.0f}px）"
+                   f"—— 把笔记本挪近些")
+    if angles and sum(1 for a in angles if abs(90 - a) <= gm.PALM_ANGLE_OK) / len(angles) < 0.8:
+        bad.append("视角偏斜（手掌视角角离 90° 太远）—— 盖子再压一点，"
+                   "或把笔记本挪到手的正前方")
+    if qcount["ok"] / processed < 0.8:
+        bad.append(f"综合视角合格率只有 {qcount['ok'] / processed * 100:.0f}%")
+    if stab["poor"] > processed * 0.2:
+        bad.append("指标稳定性差 —— 模型在猜被挡住的点，这个角度不可信")
+
+    if not bad:
+        print("✅ 机位合格。可以开始逐帧录样本了：")
+        print(f"   envs\\pg\\Scripts\\python.exe hand_probe.py "
+              f"--video \"{path}\"")
+    else:
+        print("⚠️ 机位还需要调：")
+        for b in bad:
+            print("   · " + b)
+        print("\n   ⚠️ 如果所有项都差，可能是「从侧面平视」而不是俯视 ——"
+              "那样横向的拇指-食指关系会被压扁，判不出来。")
+        print("   （笔记本要俯视只能把盖子往键盘方向压，屏幕会看不见，属正常）")
+    print("=" * 64)
+    return 0 if not bad else 1
+
+
 def _brief(m):
     return (f"fist={m['fist']:.2f} thumb_side={m['thumb_side']:+.2f} "
             f"gap={m['thumb_index_gap']:.2f} angle={m['thumb_index_angle']:.0f}°")
@@ -826,10 +1128,14 @@ def run_image(path):
         print("   要正确区分请用 --camera 模式，按 [ 或 ] 锁定被测手。")
     print(f"手部像素宽：{m['px_w']:.0f}px   掌宽：{m['palm_w']:.0f}px")
     print(f"视角判定：{quality} —— {qmsg}")
+    vlv, vmsg = gm.palm_view_verdict(m)
+    print(f"视角角　：{vlv} —— {vmsg}")
+    print("          （90° = 从正上方看手；越小说明越接近在手掌平面内平视，")
+    print("            横向的拇指-食指关系会被压扁）")
     print("\n候选指标：")
     for k in ("fist", "curl_index", "tip_close", "spread", "thumb_index_gap",
               "thumb_side", "thumb_index_dist", "thumb_index_pos",
-              "thumb_index_angle"):
+              "thumb_index_angle", "palm_view_angle"):
         v = m.get(k)
         print(f"  {gm.METRIC_INFO[k][0]:<16} {'n/a' if v is None else f'{v:.3f}'}")
     out = os.path.splitext(path)[0] + "_probe.jpg"
@@ -890,6 +1196,10 @@ def main():
     ap = argparse.ArgumentParser(description="握笔对照实验工具")
     ap.add_argument("--camera", type=int, default=None)
     ap.add_argument("--image", default=None)
+    ap.add_argument("--video", default=None,
+                    help="分析一段录像（手机架好录一段，不用推流）")
+    ap.add_argument("--scan", default=None,
+                    help="只体检一段录像的机位质量，不弹窗、不交互")
     ap.add_argument("--replay", default=None, help="回放之前用 w 存下的样本文件")
     ap.add_argument("--backend", default=None, help="强制 cv2 后端，如 dshow")
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "hand_probe"))
@@ -902,8 +1212,14 @@ def main():
         return replay(args.replay)
     if args.image:
         return run_image(args.image)
+    if args.scan:
+        return scan_video(args.scan)
+    if args.video:
+        run_video(args.video, args.out_dir)
+        return 0
     if args.camera is None:
-        ap.error("给 --camera N / --image 路径 / --replay 文件 / --selftest 之一")
+        ap.error("给 --camera N / --image 路径 / --video 路径 / --scan 路径 "
+                 "/ --replay 文件 / --selftest 之一")
     run_live(args.camera, args.backend, args.out_dir)
     return 0
 

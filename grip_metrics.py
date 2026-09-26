@@ -81,7 +81,13 @@ METRIC_INFO = {
     "thumb_index_pos": ("搭在食指哪一段", "",
                         "0=食指根，1=食指尖。≈0.3~0.9 = 压在中段"),
     "thumb_index_angle": ("拇指食指夹角", "°", "偏小可能捏太紧/包住"),
+    "palm_view_angle": ("手掌视角角", "°", "**越接近 90° 越好**：说明是从上方看手"),
 }
+
+# 视角角的目标区间。依据见 palm_view_verdict()。
+PALM_ANGLE_IDEAL = 90.0
+PALM_ANGLE_OK = 30.0        # 与 90° 相差 ≤30° 算够俯
+PALM_ANGLE_MARGINAL = 55.0  # 相差 ≤55° 勉强；再偏就是在手掌平面内看了
 
 # 「拇指包住食指」这个具体问题的判据由**两个**指标合成，缺一不可：
 #
@@ -122,6 +128,15 @@ def _norm(v):
 
 def _dot(a, b):
     return a[0] * b[0] + a[1] * b[1]
+
+
+def _angle_between(v1, v2):
+    """两个向量的夹角（度）。"""
+    n1, n2 = math.hypot(*v1), math.hypot(*v2)
+    if n1 < 1e-9 or n2 < 1e-9:
+        return None
+    c = max(-1.0, min(1.0, _dot(v1, v2) / (n1 * n2)))
+    return math.degrees(math.acos(c))
 
 
 def _angle_at(a, vertex, b):
@@ -230,6 +245,21 @@ def compute_grip_metrics(lm, w, h):
     out["thumb_index_pos"] = best_pos
 
     out["thumb_index_angle"] = _angle_at(P[THUMB_MCP], P[INDEX_MCP], P[INDEX_PIP])
+
+    # ---- 视角角：判断"你是从哪个方向看这只手" ----
+    #
+    # 手掌平面上有两条基本正交的轴：
+    #     across = 食指根 → 小指根      （掌的横向轴）
+    #     along  = 手腕   → 中指根      （掌的纵向轴）
+    #
+    # 从**正上方**（沿手掌法线）看时，这两条轴在画面里接近垂直；
+    # 如果是在**手掌平面内**平视，其中一条会被投影压短，夹角塌向 0° 或 180°。
+    #
+    # 所以这个夹角直接告诉我们：视角够不够"俯"。
+    # 对判断「拇指有没有越过食指」很关键 —— 那是个**横向**关系，
+    # 在手掌平面内平视时横向信息被压扁，等于看不见。
+    out["palm_view_angle"] = _angle_between(
+        _sub(P[PINKY_MCP], P[INDEX_MCP]), _sub(P[MIDDLE_MCP], P[WRIST]))
     return out
 
 
@@ -262,6 +292,31 @@ def view_quality(m, stability_px=None):
     if stability_px is not None and stability_px > HAND_PX_OK * 0.25:
         return "marginal", f"跟踪抖动 {stability_px:.0f}px —— 手在动，先稳一下"
     return "ok", f"手部 {w:.0f}px 宽 —— 可以判"
+
+
+def palm_view_verdict(m):
+    """判断「你是从哪个方向看这只手」—— 决定横向的拇指-食指关系看不看得见。
+
+    返回 (level, 说明)。level ∈ ok / marginal / bad
+
+    ⚠️ 为什么单独给这个判据（用户实测的直接教训）：
+       用户原本的机位是从**拇指那一侧平着看**，要看的食指被拇指挡住。
+       "把摄像头抬高、改成俯视"能解决，但"够不够俯"光靠感觉说不准。
+       这个角度是可以算出来的 —— 算出来就不会调错方向。
+    """
+    if not m:
+        return "bad", "没有数据"
+    a = m.get("palm_view_angle")
+    if a is None:
+        return "bad", "算不出视角角（关键点退化）"
+    d = abs(PALM_ANGLE_IDEAL - a)
+    if d <= PALM_ANGLE_OK:
+        return "ok", f"视角角 {a:.0f}°（接近正交）—— 够俯，横向关系看得见"
+    if d <= PALM_ANGLE_MARGINAL:
+        return "marginal", (f"视角角 {a:.0f}° —— 偏斜，能判但要打折扣；"
+                            f"再把摄像头抬高些")
+    return "bad", (f"视角角 {a:.0f}° —— 几乎在手掌平面内看，"
+                   f"拇指和食指的左右关系被压扁了；**必须改成俯视**")
 
 
 # ---------------------------------------------------------------- 合成手（测试/演示）
