@@ -60,6 +60,7 @@
    双击「窗口应用.bat」也可（出错会保留窗口，并在 app_error.log 留痕）
 """
 import argparse
+import json
 import os
 import sys
 import threading
@@ -126,6 +127,7 @@ class GripApp:
         self._photo = None                  # 持引用，避免被 GC 后画面消失
         self._last_frame = None
         self._last_frame_t = None           # 最近一次成功收到帧的时间（看门狗用）
+        self.classifier = self._load_classifier()   # 标定后的"拇指包食指"判据（可为 None）
 
         # 初始化状态（后台线程回传）
         self.init_done = False
@@ -165,6 +167,9 @@ class GripApp:
         right.pack_propagate(False)
 
         self.quality_box = self._panel(right, "机位体检")
+        self.verdict_lab = tk.Label(right, text="实时判定：未标定", bg=BG, fg=DIM,
+                                   anchor="w", font=("Microsoft YaHei UI", 12, "bold"))
+        self.verdict_lab.pack(fill="x", pady=(10, 2))
         self.count_box = self._panel(right, "样本计数")
         self.help_box = self._panel(right, "按键")
 
@@ -376,6 +381,7 @@ class GripApp:
 
             self._show_frame(vis, w, h)
             self._update_panels(m, quality, qmsg, pv, pvmsg, sel)
+            self._update_verdict(m)
             self.last = (m, quality, sel, self.rec.note)
         except Exception as e:                           # noqa: BLE001
             import traceback
@@ -452,6 +458,51 @@ class GripApp:
                   "空格 冻结     p 出表\n"
                   "w 存样本      q 退出"),
             fg=DIM)
+
+    # ------------------------------------------------------------ 实时判定（标定后）
+    def _load_classifier(self):
+        """读 pen_grip_config.json 的 classifier 段（由 tools/calibrate.py 写）。"""
+        try:
+            with open(os.path.join(ROOT, "pen_grip_config.json"),
+                      encoding="utf-8") as f:
+                cfg = json.load(f)
+            c = cfg.get("classifier")
+            if c and c.get("metrics"):
+                return c
+        except Exception:                                    # noqa: BLE001
+            pass
+        return None
+
+    def _eval_classifier(self, m):
+        """返回触发报警的指标名；未触发返回 None。未标定返回 None。"""
+        if not self.classifier or not m:
+            return None
+        for met, spec in self.classifier.get("metrics", {}).items():
+            v = m.get(met)
+            if v is None:
+                continue
+            d, t = spec.get("dir"), spec.get("th")
+            if d == "+" and v > t:
+                return met
+            if d == "-" and v < t:
+                return met
+        return None
+
+    def _update_verdict(self, m):
+        if self.classifier is None:
+            self.verdict_lab.configure(
+                text="实时判定：未标定（先录样本跑 calibrate）", fg=DIM)
+            return
+        if m is None:
+            self.verdict_lab.configure(text="实时判定：—（没检测到手）", fg=DIM)
+            return
+        tripped = self._eval_classifier(m)
+        if tripped:
+            cn = gm.METRIC_INFO.get(tripped, (tripped,))[0]
+            self.verdict_lab.configure(
+                text=f"⚠️ 拇指包食指（{cn}越线）", fg=BADC)
+        else:
+            self.verdict_lab.configure(text="✅ 正常握笔", fg=OKC)
 
     def _sel_text(self, sel):
         if sel is None:

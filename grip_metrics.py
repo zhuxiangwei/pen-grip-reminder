@@ -268,8 +268,12 @@ def compute_grip_metrics(lm, w, h):
 # 手部像素宽度门槛。依据见 docs/04：MediaPipe 的掌部检测器把 ROI 缩到 224x224，
 # 手太小就抓不稳；而我们要分辨几十度的形态差异，需要更高余量。
 # ⚠️ 经验值，不是论文阈值 —— 真正确认要看手部对照工具的实测。
-HAND_PX_OK = 200.0
-HAND_PX_MARGINAL = 120.0
+# 2026-09-27 调整：用户实测固定距离的「正前方俯视」机位下，手宽最多只能到
+# ~150px（200px 物理上达不到）。把门槛放宽到 130/80，让 150+ 稳定判为 ok，
+# 避免所有样本都被标成 marginal 一直告警。指标本身大多按掌宽归一化，
+# 对绝对像素大小不敏感，放宽门槛不影响判据可靠性。
+HAND_PX_OK = 130.0
+HAND_PX_MARGINAL = 80.0
 
 
 def view_quality(m, stability_px=None):
