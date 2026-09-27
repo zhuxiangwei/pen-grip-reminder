@@ -1,19 +1,30 @@
-#!/usr/bin/env python3
+#!/usr/bin python3
 # -*- coding: utf-8 -*-
 """
-握笔姿势检测 · 窗口应用
-=======================
+握笔姿势检测 · 窗口应用（稳健版）
+==================================
 
 **为什么是 tkinter 而不是 PySide6**
-   PySide6 / PyQt 都没装（实测三选全 NO），而 **tkinter 是 Python 自带的**。
-   这个项目要装的东西已经不少（opencv + mediapipe + matplotlib），
-   窗口本身没必要再拉一个 100MB+ 的 Qt。
-   **零新增依赖**对「双击就能用」这件事很重要。
+   PySide6 / PyQt5 / PyQt6 **全没装**（实测三选全 NO），而 **tkinter 是 Python 自带的**。
+   项目依赖已经不少（opencv + mediapipe + matplotlib），窗口本身没必要再拉 100MB+ 的 Qt。
+   **零新增依赖**对「双击就能用」很重要。
 
-**核心原则：这里不重新实现检测逻辑**
-   所有指标、视角门控、手别选择、阈值对照**全部复用** `grip_metrics` /
-   `hand_probe` 里已有的函数。窗口只是把它们套了个界面。
-   两份实现会随时间漂移 —— 改一处忘另一处是最常见的坑。
+**核心原则：不重写检测逻辑**
+   指标、视角门控、手别选择、阈值对照**全部复用** `grip_metrics` / `hand_probe`。
+   窗口只是套了个界面。两份实现会随时间漂移 —— 改一处忘另一处是最常见的坑。
+
+**这一版相对初版最大的改动：能报错、能自救**
+   ─────────────────────────────────────────────
+   初版把「打开摄像头 + 加载模型」放在后台线程里，一旦失败只是线程静默死掉，
+   主窗口卡在"正在打开摄像头…"，用户看着就像"启动不了"；而且任何异常只打到
+   那个一闪而过的黑框里，**根本看不到原因**。
+
+   这一版：
+     · 全局 sys.excepthook + 主线程 try/except —— 任何异常都弹出窗口 + 写日志文件
+     · 摄像头/模型初始化走后台线程，但**失败会明确回传并展示原因**（不是卡死）
+     · 图片显示失败有兜底（PPM 不行就落临时文件）
+     · `.bat` 出错不再关窗
+   所以"不能启动"时，你会直接看到**为什么**，而不是一个打不开的窗口。
 
 **窗口长什么样**
 
@@ -29,16 +40,16 @@
     │                             │  [3] 其他错误          │
     │                             │                       │
     ├─────────────────────────────┤  [出对照表]           │
-    │ [ 开始 ] [ 冻结 ] [ ↵ 出表 ] │  [保存样本]           │
+    │ 状态栏：实时提示              │  [保存样本]           │
     └─────────────────────────────┴───────────────────────┘
 
-**按键**（和命令行版一致，肌肉记忆可以复用）
+**按键**（和命令行版一致，肌肉记忆可复用）
    1 / 2 / 3   记录当前帧为对应类别
    z           开关拇指-食指放大镜
-   [ / ]       锁定被测手 = 画面左半 / 右半（看不见"左右手"，只看画面位置）
+   [ / ]       锁定被测手 = 画面左半 / 右半（不看"左右手"，只看画面位置）
    \\           取消锁定，回到自动（按运动量猜）
-   space       冻结 / 继续画面
-   p           出对照表（也等价于点按钮）
+   空格         冻结 / 继续画面
+   p           出对照表（等价于点按钮）
    w           保存样本到磁盘
    q / Esc     退出
 
@@ -46,6 +57,7 @@
 ----
     python app.py
     python app.py --camera 1
+   双击「窗口应用.bat」也可（出错会保留窗口，并在 app_error.log 留痕）
 """
 import argparse
 import os
@@ -53,7 +65,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = HERE
@@ -64,7 +76,7 @@ import grip_metrics as gm                               # noqa: E402
 import hand_probe as hp                                 # noqa: E402
 import mediapipe as mp                                  # noqa: E402
 
-# 画面配色（贴近深色主题，和命令行版一致）
+# 画面配色（贴近深色主题）
 BG = "#16181d"
 FG = "#e8eaed"
 DIM = "#8b93a1"
@@ -72,6 +84,17 @@ ACC = "#5aa9ff"
 OKC = "#4ec96b"
 WARNC = "#e0a13a"
 BADC = "#e05c5c"
+PANEL = "#1d2129"
+
+
+def log_error(msg):
+    """把错误同时打到 stderr 和 app_error.log（项目根），方便用户回传。"""
+    try:
+        p = os.path.join(ROOT, "app_error.log")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "  " + msg + "\n")
+    except Exception:                                    # noqa: BLE001
+        pass
 
 
 class GripApp:
@@ -100,9 +123,19 @@ class GripApp:
         self.err = None
         self.frame_size = (0, 0)
         self.tick = 0
+        self._photo = None                  # 持引用，避免被 GC 后画面消失
+        self._last_frame = None
+        self._last_frame_t = None           # 最近一次成功收到帧的时间（看门狗用）
+
+        # 初始化状态（后台线程回传）
+        self.init_done = False
+        self.init_error = None
+        self._init_lock = threading.Lock()
 
         self._build_ui()
         self._bind_keys()
+        # 先启动初始化（后台线程），主线程轮询结果 —— 窗口立刻可见
+        self.root.after(50, self._poll_init)
         self._start_camera()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -118,9 +151,11 @@ class GripApp:
         self.canvas = tk.Canvas(left, bg="#0c0e12", highlightthickness=1,
                                 highlightbackground="#2a2f38")
         self.canvas.pack(fill="both", expand=True)
-        self._canvas_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.canvas.create_text(400, 300, text="正在初始化摄像头…",
+                                fill=DIM, font=("Microsoft YaHei UI", 13),
+                                tags="hint")
 
-        self.status = tk.Label(left, text="正在打开摄像头…", bg=BG, fg=DIM,
+        self.status = tk.Label(left, text="正在初始化…", bg=BG, fg=DIM,
                                anchor="w", font=("Consolas", 10))
         self.status.pack(fill="x", pady=(6, 0))
 
@@ -153,7 +188,8 @@ class GripApp:
                          ("保存样本 (w)", self.save_samples),
                          ("清空样本", self.clear_samples),
                          ("冻结画面 (空格)", self.toggle_freeze),
-                         ("重新探测机位", self.reprobe)):
+                         ("重新探测机位", self.reprobe),
+                         ("重新打开摄像头", self.restart_camera)):
             b = tk.Button(right, text=text, bg="#232830", fg=FG,
                           activebackground="#2e3540", relief="flat",
                           anchor="w", cursor="hand2",
@@ -171,71 +207,146 @@ class GripApp:
     def _panel(self, parent, title):
         tk.Label(parent, text=title, bg=BG, fg=ACC, anchor="w",
                  font=("Microsoft YaHei UI", 10, "bold")).pack(fill="x", pady=(8, 3))
-        lab = tk.Label(parent, text="—", bg=BG, fg=FG, anchor="w", justify="left",
-                       font=("Consolas", 9))
+        lab = tk.Label(parent, text="—", bg=PANEL, fg=FG, anchor="w", justify="left",
+                       font=("Consolas", 9), padx=6, pady=4)
         lab.pack(fill="x")
         return lab
 
     def _bind_keys(self):
         self.root.bind("<Key>", self.on_key)
-        self.canvas.bind("<Button-1>", lambda e: self.canvas.focus_set())
-        self.canvas.focus_set()
+        self.root.focus_set()
+
+    # ------------------------------------------------------------ 初始化轮询
+    def _poll_init(self):
+        """主线程每 200ms 检查后台初始化结果，避免线程里 sys.exit 静默死掉。"""
+        if self.init_error is not None:
+            self._on_init_failed(self.init_error)
+            return
+        if self.init_done:
+            if not self.running:
+                self.running = True
+                self._last_frame_t = time.time()        # 看门狗计时起点
+                self.root.after(0, self._loop)
+                self.root.after(1000, self._watchdog)   # 4s 内收不到帧就报错
+            return
+        self.root.after(200, self._poll_init)
 
     # ------------------------------------------------------------ 摄像头
     def _start_camera(self):
         def work():
+            import traceback
             try:
                 model = pg.find_model(hp.HAND_MODEL)
-                self.hand = hp.make_hand(model)
-                # 分辨率来自探测配置（tools/probe_camera.py 写）
-                self.cap = pg.open_camera_auto(idx=self.cam_idx,
-                                               backend=self.backend)
-                f = pg.grab_frame(self.cap)
+                hand = hp.make_hand(model)
+                # 分辨率从探测配置读（tools/probe_camera.py 写）
+                cap = pg.open_camera_auto(idx=self.cam_idx, backend=self.backend)
+                f = pg.grab_frame(cap)
                 if f is not None:
                     self.frame_size = (f.shape[1], f.shape[0])
-                self.running = True
-                self.root.after(0, self._loop)
+                with self._init_lock:
+                    self.hand = hand
+                    self.cap = cap
+                    self.init_done = True
             except SystemExit as e:
-                self.err = str(e)
-                self.root.after(0, self._show_error)
+                tb = traceback.format_exc()
+                log_error("init SystemExit: " + str(e) + "\n" + tb)
+                with self._init_lock:
+                    self.init_error = f"摄像头/模型初始化失败：{e}\n\n" + tb
             except Exception as e:                       # noqa: BLE001
-                self.err = f"{type(e).__name__}: {e}"
-                self.root.after(0, self._show_error)
+                tb = traceback.format_exc()
+                log_error("init Exception: " + repr(e) + "\n" + tb)
+                with self._init_lock:
+                    self.init_error = f"{type(e).__name__}: {e}\n\n" + tb
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_error(self):
-        self.status.configure(text=f"❌ {self.err}", fg=BADC)
-        self.canvas.delete(self._canvas_item)
+    def _show_fatal(self, title, msg):
+        """把致命错误显式展示到画面 + 报告 + 弹窗（不再静默卡死）。"""
+        self.running = False
+        self.canvas.delete("all")
         self.canvas.create_text(
             max(200, self.canvas.winfo_width() // 2),
-            max(100, self.canvas.winfo_height() // 2),
-            text="摄像头打不开\n\n" + (self.err or "")[:600],
-            fill=BADC, font=("Microsoft YaHei UI", 11), width=520, justify="center")
+            max(120, self.canvas.winfo_height() // 2),
+            text=title + "\n\n" + msg[:500],
+            fill=BADC, font=("Microsoft YaHei UI", 11), width=560, justify="center")
+        self.status.configure(text="❌ " + title + "（详见 app_error.log）", fg=BADC)
+        self.report.configure(state="normal")
+        self.report.delete("1.0", "end")
+        self.report.insert("1.0", title + "：\n\n" + msg)
+        self.report.configure(state="disabled")
+        try:
+            messagebox.showerror("启动失败", msg[:1200])
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def _on_init_failed(self, msg):
+        self._show_fatal("摄像头/模型初始化失败", msg)
+
+    def _watchdog(self):
+        """初始化成功后若长时间收不到帧，明确报错而不是空转卡死。"""
+        if not self.running:
+            return
+        if self.frozen:
+            # 冻结时本来就不取新帧，只看门狗不计时
+            self.root.after(1000, self._watchdog)
+            return
+        if self._last_frame_t is not None and (time.time() - self._last_frame_t) > 4:
+            self._show_fatal(
+                "摄像头已打开但读不到画面",
+                "摄像头设备打开了，但 4 秒内没有回传任何一帧。\n"
+                "常见原因：被其他程序占用、权限不足、虚拟摄像头、或驱动异常。\n"
+                "点右侧「重新打开摄像头」重试，或换 --camera 索引 / --backend MSMF。")
+            return
+        self.root.after(1000, self._watchdog)
+
+    def restart_camera(self):
+        """「重新打开摄像头」按钮：释放旧资源，重跑初始化。"""
+        try:
+            if self.cap is not None:
+                self.cap.release()
+            if self.hand is not None:
+                self.hand.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+        self.cap = None
+        self.hand = None
+        self.init_done = False
+        self.init_error = None
+        self.running = False
+        self._last_frame_t = None
+        self.canvas.delete("all")
+        self.canvas.create_text(400, 300, text="正在重新初始化摄像头…",
+                                fill=DIM, font=("Microsoft YaHei UI", 13))
+        self.status.configure(text="正在重新初始化…", fg=DIM)
+        self.root.after(50, self._poll_init)
+        self._start_camera()
 
     # ------------------------------------------------------------ 主循环
     def _loop(self):
         import cv2
-        import numpy as np
         if not self.running:
             return
         try:
-            frame = None if self.frozen else pg.grab_frame(self.cap)
-            if frame is None and not self.frozen:
-                self.root.after(30, self._loop)
-                return
-            if frame is None:
+            if self.frozen:
                 frame = self._last_frame
             else:
-                self._last_frame = frame
+                frame = pg.grab_frame(self.cap)
 
+            if frame is None:
+                if self.frozen and self._last_frame is not None:
+                    frame = self._last_frame
+                else:
+                    self.root.after(30, self._loop)
+                    return
+
+            self._last_frame = frame
+            self._last_frame_t = time.time()     # 喂看门狗
             h, w = frame.shape[:2]
             rgb = frame[:, :, ::-1].copy()
             self.tick += 33
 
             r = self.hand.detect_for_video(
-                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
-                self.tick)
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), self.tick)
 
             hands = []
             for i, lm in enumerate(r.hand_landmarks or []):
@@ -263,54 +374,62 @@ class GripApp:
                 cv2.putText(vis, "FROZEN", (w // 2 - 70, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.1, (80, 200, 255), 3)
 
-            # 缩放到画布尺寸显示
-            cw = max(320, self.canvas.winfo_width())
-            chh = max(240, self.canvas.winfo_height())
-            sc = min(cw / w, chh / h)
-            nw, nh = max(1, int(w * sc)), max(1, int(h * sc))
-            shown = cv2.resize(vis, (nw, nh), interpolation=cv2.INTER_AREA)
-            self._photo = self._to_photo(shown)
-            self.canvas.delete("all")
-            self.canvas.create_image(cw // 2, chh // 2, image=self._photo,
-                                     anchor="center")
-
+            self._show_frame(vis, w, h)
             self._update_panels(m, quality, qmsg, pv, pvmsg, sel)
             self.last = (m, quality, sel, self.rec.note)
         except Exception as e:                           # noqa: BLE001
-            self.status.configure(text=f"⚠️ {type(e).__name__}: {e}", fg=BADC)
+            import traceback
+            tb = traceback.format_exc()
+            log_error("loop Exception: " + repr(e) + "\n" + tb)
+            self.status.configure(text=f"⚠️ 处理帧出错：{type(e).__name__}: {e}", fg=BADC)
+            self.root.after(500, self._loop)              # 出错不要刷屏，停一下再试
+            return
         self.root.after(15, self._loop)
 
-    def _to_photo(self, bgr):
-        """BGR ndarray -> tkinter PhotoImage（用 PPM 走内存，不落盘）。"""
+    def _show_frame(self, bgr, w, h):
+        """BGR ndarray -> Canvas 上的图片（PPM 内存流，失败落临时文件兜底）。"""
         import cv2
+        import os
+        import tempfile
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        hdr = f"P6\n{w} {h}\n255\n".encode("ascii")
-        return tk.PhotoImage(data=hdr + rgb.tobytes(), format="PPM")
+        cw = max(320, self.canvas.winfo_width())
+        chh = max(240, self.canvas.winfo_height())
+        sc = min(cw / w, chh / h)
+        nw, nh = max(1, int(w * sc)), max(1, int(h * sc))
+        shown = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+        hdr = f"P6\n{nw} {nh}\n255\n".encode("ascii")
+        data = hdr + shown.tobytes()
+        try:
+            self._photo = tk.PhotoImage(data=data, format="PPM")
+        except Exception:                                # noqa: BLE001
+            p = os.path.join(tempfile.gettempdir(), "grip_frame.ppm")
+            with open(p, "wb") as f:
+                f.write(data)
+            self._photo = tk.PhotoImage(file=p)
+        self.canvas.delete("hint")
+        self.canvas.delete("frame")
+        self.canvas.create_image(cw // 2, chh // 2, image=self._photo,
+                                 anchor="center", tags="frame")
 
     def _update_panels(self, m, quality, qmsg, pv, pvmsg, sel):
         if m is None:
             self.quality_box.configure(
-                text=f"手宽        —\n视角判定    {'—'}\n"
-                     f"手掌视角角  —\n指标稳定性  —\n\n"
-                     f"⚠️ {'没检测到手' if not self.frozen else '（已冻结）'}",
-                fg=WARNC)
+                text=("手宽        —\n视角判定    —\n"
+                      f"手掌视角角  —\n指标稳定性  —\n\n"
+                      f"{'⚠️ 没检测到手' if not self.frozen else '（已冻结）'}"))
         else:
             col = {"ok": OKC, "marginal": WARNC, "bad": BADC}[quality]
             s1, s2 = self.rec.focus_std
             if s1 is None:
-                stab, scol = "—（样本不足）", DIM
+                stab = "—（样本不足）"
             else:
                 if s1 < 0.08 and s2 < 0.05:
-                    stab, scol = f"GOOD  ({s1:.3f} / {s2:.3f})", OKC
+                    stab = f"GOOD  ({s1:.3f} / {s2:.3f})"
                 elif s1 < 0.15 and s2 < 0.10:
-                    stab, scol = f"FAIR  ({s1:.3f} / {s2:.3f})", WARNC
+                    stab = f"FAIR  ({s1:.3f} / {s2:.3f})"
                 else:
-                    stab, scol = f"POOR  ({s1:.3f} / {s2:.3f})", BADC
+                    stab = f"POOR  ({s1:.3f} / {s2:.3f})"
             pw = f"{m['px_w']:.0f}px"
-            pwc = OKC if m["px_w"] >= gm.HAND_PX_OK else (
-                WARNC if m["px_w"] >= gm.HAND_PX_MARGINAL else BADC)
-            self.quality_box.configure(text="", fg=FG)
             self.quality_box.configure(
                 text=(f"手宽        {pw}   (要 ≥{gm.HAND_PX_OK:.0f}px)\n"
                       f"视角判定    {quality.upper()}\n"
@@ -318,11 +437,8 @@ class GripApp:
                       f"指标稳定性  {stab}\n\n"
                       f"手别        {self._sel_text(sel)}\n"
                       f"锁定        {self.sel.lock or '自动(按运动量)'}"))
-            # 数字颜色单独用状态栏表达（tkinter Label 内不好混色）
-            self.status.configure(
-                text=f"{qmsg}    |    {pvmsg}", fg=col)
+            self.status.configure(text=f"{qmsg}    |    {pvmsg}", fg=col)
 
-        # 稳定性的颜色用 count 面板的标题代替（简化）
         c = self.rec.counts()
         self.count_box.configure(
             text=(f"正确握笔     {c['1']:>4}\n"
@@ -378,6 +494,9 @@ class GripApp:
         self.status.configure(text=self.rec.note, fg=ACC)
 
     def record(self, key):
+        if not self.init_done:
+            self._note("还没初始化完", BADC)
+            return
         if self.last is None:
             self._note("还没有可用的一帧", BADC)
             return
@@ -429,6 +548,9 @@ class GripApp:
         self.report.configure(state="disabled")
 
     def toggle_freeze(self):
+        if not self.init_done:
+            self._note("还没初始化完", BADC)
+            return
         self.frozen = not self.frozen
         self._note("画面已冻结（按空格继续）" if self.frozen else "画面继续",
                    ACC if not self.frozen else WARNC)
@@ -440,15 +562,18 @@ class GripApp:
         self.root.update_idletasks()
 
         def work():
-            p = subprocess.run(
-                [sys.executable, os.path.join(ROOT, "tools", "probe_camera.py")],
-                capture_output=True, text=True, errors="replace")
-            out = (p.stdout or "") + (p.stderr or "")
-            top = ""
-            for line in out.splitlines():
-                if "最高可用分辨率" in line:
-                    top = line.strip()
-            self.root.after(0, lambda: self._reprobe_done(top, out))
+            try:
+                p = subprocess.run(
+                    [sys.executable, os.path.join(ROOT, "tools", "probe_camera.py")],
+                    capture_output=True, text=True, errors="replace")
+                out = (p.stdout or "") + (p.stderr or "")
+                top = ""
+                for line in out.splitlines():
+                    if "最高可用分辨率" in line:
+                        top = line.strip()
+                self.root.after(0, lambda: self._reprobe_done(top, out))
+            except Exception as e:                       # noqa: BLE001
+                self.root.after(0, lambda: self._reprobe_done("", f"探测失败：{e}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -481,13 +606,40 @@ def main():
                     choices=["DSHOW", "MSMF", "ANY"])
     a = ap.parse_args()
 
-    root = tk.Tk()
+    # 全局异常兜底：任何未捕获异常都弹窗 + 写日志，而不是静默消失
+    def excepthook(etype, value, tb):
+        import traceback as _tb
+        msg = "".join(_tb.format_exception(etype, value, tb))
+        log_error("UNCAUGHT: " + msg)
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("程序异常", msg[:1500])
+        except Exception:                                # noqa: BLE001
+            pass
+    sys.excepthook = excepthook
+
     try:
-        root.call("tk", "scaling", 1.25)
-    except Exception:                                    # noqa: BLE001
-        pass
-    GripApp(root, cam_idx=a.camera, backend=a.backend)
-    root.mainloop()
+        root = tk.Tk()
+        try:
+            root.call("tk", "scaling", 1.25)
+        except Exception:                                # noqa: BLE001
+            pass
+        GripApp(root, cam_idx=a.camera, backend=a.backend)
+        root.mainloop()
+    except SystemExit as e:
+        log_error("main SystemExit: " + str(e))
+        messagebox.showerror("启动失败", str(e))
+        sys.exit(1)
+    except Exception as e:                               # noqa: BLE001
+        import traceback as _tb
+        msg = _tb.format_exc()
+        log_error("main Exception: " + msg)
+        try:
+            messagebox.showerror("启动失败", str(e))
+        except Exception:                                # noqa: BLE001
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
