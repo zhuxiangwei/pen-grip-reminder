@@ -496,6 +496,12 @@ class GripApp:
         if m is None:
             self.verdict_lab.configure(text="实时判定：—（没检测到手）", fg=DIM)
             return
+        # 稳定性门控：关键点在猜时（笔挡住手指）指标会飞，绝不能在这个状态下报警
+        s0, s1 = self.rec.focus_std
+        if s0 is None or s0 >= 0.15 or (s1 or 0.0) >= 0.10:
+            self.verdict_lab.configure(
+                text="⏳ 关键点不稳，暂停判定（笔挡住手指时模型在猜）", fg=WARNC)
+            return
         tripped = self._eval_classifier(m)
         if tripped:
             cn = gm.METRIC_INFO.get(tripped, (tripped,))[0]
@@ -561,6 +567,12 @@ class GripApp:
             return
         if m is None:
             self._note("拒绝记录：这一帧没数据", BADC)
+            return
+        # 稳定性门控（2026-09-27 真实视频的教训）：笔挡住拇指/食指时 MediaPipe
+        # 在猜关键点，thumb_side 会飞到 ±2~3（物理不可能）。这类帧绝不能进样本。
+        s0, s1 = self.rec.focus_std
+        if s0 is not None and (s0 >= 0.15 or (s1 or 0.0) >= 0.10):
+            self._note("拒绝记录：关键点在猜（笔挡住了手指），停笔稳一秒再按", BADC)
             return
         name = hp.CLASSES[key][0]
         if quality == "bad":
